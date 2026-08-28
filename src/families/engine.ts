@@ -1,0 +1,684 @@
+import { createMatrixLayout, validateConfig as validateTextLabConfig } from '../text-lab/domain/config'
+import { canonicalizeSource } from '../text-lab/engine/segment'
+import { encodeIdentity } from '../text-lab/engine/encode'
+import { vectorNorm } from '../text-lab/engine/matrix'
+import {
+  createContextSpaceId,
+  createIdentitySpaceId,
+  createRepresentationSpaceId,
+  digestText,
+  digestVector,
+} from '../text-lab/engine/representation'
+import { discoverFamilies } from './clustering'
+import {
+  assertIdentityUnchanged,
+  buildBehaviorProfiles,
+  createBehaviorSpaceId,
+  profilesFingerprint,
+  snapshotIdentityDigests,
+} from './profile'
+import { applyUtilityLifecycle, familyUtilityCaseCount, measureFamilyAblationUtilities } from './utility'
+import {
+  buildFamilyTransitions,
+  buildSparseNeuronTransitions,
+  computeRouteDistribution,
+} from './transitions'
+import { buildEventCoalitions } from './coalition'
+import type {
+  FamilyAnalysisInput,
+  FamilyConfig,
+  FamilyInputManifest,
+  FamilyInputManifestEntry,
+  FamilyProgress,
+  FamilyRun,
+  FamilyRunInput,
+  FamilyRunOptions,
+  FamilyStage,
+  FamilySynthesisDecisionInput,
+} from './types'
+import { compareText, stableDigest } from './sparse'
+
+export const DEFAULT_FAMILY_CONFIG: Readonly<FamilyConfig> = Object.freeze({
+  profileDimension: 256,
+  maximumProfileFeatures: 96,
+  contextRadius: 2,
+  maximumTransitionNeighbors: 8,
+  maximumIndexBucketSize: 128,
+  maximumCandidateNeighbors: 24,
+  maximumFamilyMembers: 64,
+  maximumFamilies: 128,
+  maximumMembershipsPerNeuron: 5,
+  minimumFormationSimilarity: 0.48,
+  minimumMembershipScore: 0.34,
+  minimumCoreMembership: 0.56,
+  minimumSupport: 3,
+  minimumSources: 2,
+  maximumOutgoingFamilyTransitions: 12,
+  runtimeActivationThreshold: 0.18,
+  maximumActiveNeurons: 128,
+  maximumActiveFamilies: 16,
+  maximumCoalitions: 8,
+  maximumRoleCandidates: 4,
+  coalitionBeamWidth: 32,
+  routingCandidateLimit: 32,
+  routingTemperature: 0.35,
+  habitRouteWeight: 0.35,
+  familyRouteWeight: 0.45,
+  signalRouteWeight: 0.25,
+  repetitionPenaltyWeight: 0.2,
+  utilityMinimumCases: 8,
+  utilityAlternativeCount: 4,
+  utilityEpsilon: 1e-6,
+  lifecycleStabilityThreshold: 0.75,
+  lifecycleUtilityThreshold: 0.01,
+  yieldEveryOperations: 512,
+  hashSeed: 0x6a09e667,
+})
+
+type FamilyValidationCode =
+  | 'EMPTY_INPUT'
+  | 'INVALID_CONFIG'
+  | 'INVALID_ANALYSIS'
+  | 'REPRESENTATION_SPACE_MISMATCH'
+  | 'INVALID_SYNTHESIS_DECISION'
+  | 'CANCELLED'
+
+export class FamilyValidationError extends TypeError {
+  constructor(
+    public readonly code: FamilyValidationCode,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'FamilyValidationError'
+  }
+}
+
+export class FamilyCancelledError extends Error {
+  readonly code = 'CANCELLED'
+
+  constructor() {
+    super('Nöron aileleri deneyi kullanıcı tarafından durduruldu.')
+    this.name = 'FamilyCancelledError'
+  }
+}
+
+const POSITIVE_INTEGER_KEYS: Array<keyof FamilyConfig> = [
+  'profileDimension',
+  'maximumProfileFeatures',
+  'contextRadius',
+  'maximumTransitionNeighbors',
+  'maximumIndexBucketSize',
+  'maximumCandidateNeighbors',
+  'maximumFamilyMembers',
+  'maximumFamilies',
+  'maximumMembershipsPerNeuron',
+  'minimumSupport',
+  'minimumSources',
+  'maximumOutgoingFamilyTransitions',
+  'maximumActiveNeurons',
+  'maximumActiveFamilies',
+  'maximumCoalitions',
+  'maximumRoleCandidates',
+  'coalitionBeamWidth',
+  'routingCandidateLimit',
+  'utilityMinimumCases',
+  'utilityAlternativeCount',
+  'yieldEveryOperations',
+]
+
+export function createFamilyConfig(overrides: Partial<FamilyConfig> = {}): FamilyConfig {
+  const config = { ...DEFAULT_FAMILY_CONFIG, ...overrides }
+  if (POSITIVE_INTEGER_KEYS.some((key) => !Number.isInteger(config[key]) || config[key] < 1)) {
+    throw new FamilyValidationError('INVALID_CONFIG', 'Aile kapasite ve destek sınırları pozitif tam sayı olmalıdır.')
+  }
+  const unitKeys: Array<keyof FamilyConfig> = [
+    'minimumFormationSimilarity',
+    'minimumMembershipScore',
+    'minimumCoreMembership',
+    'runtimeActivationThreshold',
+    'habitRouteWeight',
+    'familyRouteWeight',
+    'signalRouteWeight',
+    'repetitionPenaltyWeight',
+    'lifecycleStabilityThreshold',
+  ]
+  if (unitKeys.some((key) => !Number.isFinite(config[key]) || config[key] < 0 || config[key] > 1)) {
+    throw new FamilyValidationError('INVALID_CONFIG', 'Aile eşikleri ve yönlendirme ağırlıkları 0 ile 1 arasında olmalıdır.')
+  }
+  if (
+    !Number.isFinite(config.routingTemperature) || config.routingTemperature <= 0 ||
+    !Number.isFinite(config.utilityEpsilon) || config.utilityEpsilon <= 0 || config.utilityEpsilon >= 1 ||
+    !Number.isFinite(config.lifecycleUtilityThreshold) || config.lifecycleUtilityThreshold < 0 ||
+    !Number.isInteger(config.hashSeed)
+  ) {
+    throw new FamilyValidationError('INVALID_CONFIG', 'Sıcaklık, fayda ve hash ayarları geçersiz.')
+  }
+  if (config.maximumProfileFeatures > config.profileDimension) {
+    throw new FamilyValidationError('INVALID_CONFIG', 'Seyrek profil özelliği sayısı davranış uzayı boyutunu aşamaz.')
+  }
+  if (config.maximumFamilyMembers < config.minimumSupport) {
+    throw new FamilyValidationError('INVALID_CONFIG', 'Aile üye sınırı asgari bağımsız desteği karşılamalıdır.')
+  }
+  if (config.minimumSources < 2 || config.minimumSupport < config.minimumSources) {
+    throw new FamilyValidationError('INVALID_CONFIG', 'Aile doğumu için en az iki kaynak ve kaynak sayısından az olmayan destek gerekir.')
+  }
+  if (config.minimumCoreMembership < config.minimumMembershipScore) {
+    throw new FamilyValidationError('INVALID_CONFIG', 'Çekirdek üyelik eşiği asgari üyelik eşiğinden küçük olamaz.')
+  }
+  return config
+}
+
+function finiteVector(value: unknown, length: number): value is Float32Array {
+  return value instanceof Float32Array && value.length === length && value.every(Number.isFinite)
+}
+
+function validateAnalysis(analysis: FamilyAnalysisInput): void {
+  if (
+    !analysis ||
+    analysis.format !== 'metin-laboratuvari-analysis' ||
+    analysis.version !== 2 ||
+    typeof analysis.runId !== 'string' || !analysis.runId ||
+    typeof analysis.sourceDigest !== 'string' || !analysis.sourceDigest ||
+    typeof analysis.representationSpaceId !== 'string' || !analysis.representationSpaceId ||
+    !analysis.source || !analysis.config || !analysis.layout ||
+    !Array.isArray(analysis.nodes) || !analysis.nodes.length ||
+    !(analysis.habitProbabilities instanceof Float32Array)
+  ) {
+    throw new FamilyValidationError('INVALID_ANALYSIS', 'Metin Laboratuvarı v2 aile girdisi eksik veya bozuk.')
+  }
+  try {
+    validateTextLabConfig(analysis.config)
+  } catch (cause) {
+    throw new FamilyValidationError(
+      'INVALID_ANALYSIS',
+      cause instanceof Error ? cause.message : 'Metin Laboratuvarı ayarları geçersiz.',
+    )
+  }
+  const canonical = canonicalizeSource(analysis.source)
+  const expectedLayout = createMatrixLayout(analysis.config)
+  const expectedIdentitySpaceId = createIdentitySpaceId(analysis.config, expectedLayout)
+  const expectedContextSpaceId = createContextSpaceId(analysis.config, expectedLayout)
+  if (
+    canonical.text !== analysis.source.text ||
+    digestText(canonical.text) !== analysis.sourceDigest ||
+    analysis.layout.side !== expectedLayout.side ||
+    analysis.layout.identityLength !== expectedLayout.identityLength ||
+    analysis.layout.relationLength !== expectedLayout.relationLength ||
+    analysis.identitySpaceId !== expectedIdentitySpaceId ||
+    analysis.contextSpaceId !== expectedContextSpaceId ||
+    analysis.representationSpaceId !== createRepresentationSpaceId(
+      expectedIdentitySpaceId,
+      expectedContextSpaceId,
+    ) ||
+    analysis.habitProbabilities.length !== analysis.nodes.length * analysis.nodes.length
+  ) {
+    throw new FamilyValidationError('INVALID_ANALYSIS', 'Aile girdisinin kaynak özeti, matris düzeni veya H⁰ boyutu doğrulanamadı.')
+  }
+  const ids = new Set<string>()
+  for (const node of analysis.nodes) {
+    if (!node || typeof node !== 'object' || typeof node.text !== 'string') {
+      throw new FamilyValidationError('INVALID_ANALYSIS', 'Ham nöron kayıtlarından biri eksik veya bozuk.')
+    }
+    const expectedIdentity = encodeIdentity(node.text, expectedLayout, analysis.config)
+    if (
+      typeof node.id !== 'string' || !node.id || ids.has(node.id) ||
+      node.sourceId !== analysis.source.id ||
+      !Number.isInteger(node.start) || !Number.isInteger(node.end) ||
+      node.start < 0 || node.end <= node.start || node.end > canonical.text.length ||
+      canonical.text.slice(node.start, node.end) !== node.text ||
+      !finiteVector(node.identity, expectedLayout.identityLength) ||
+      !finiteVector(node.relation, expectedLayout.relationLength) ||
+      digestVector(node.identity) !== node.identityDigest ||
+      expectedIdentity.some((value, index) => value !== node.identity[index]) ||
+      !Number.isFinite(node.identityNorm) || !Number.isFinite(node.relationNorm) ||
+      Math.abs(vectorNorm(node.identity) - node.identityNorm) > 1e-5 ||
+      Math.abs(vectorNorm(node.relation) - node.relationNorm) > 1e-5 ||
+      node.identity.some((value) => value < -1 || value > 1) ||
+      node.relation.some((value) => value < -1 || value > 1) ||
+      !Number.isFinite(node.contextSupport) || node.contextSupport < 0 ||
+      !Number.isInteger(node.contextRevision) || node.contextRevision < 0 ||
+      !node.trace ||
+      !Number.isFinite(node.trace.inheritedNorm) ||
+      !Number.isFinite(node.trace.parentIdentityCompatibility) ||
+      !Number.isFinite(node.trace.parentGain) ||
+      !Number.isFinite(node.trace.siblingGain) ||
+      (node.trace.siblingIdentityCompatibility !== null && !Number.isFinite(node.trace.siblingIdentityCompatibility)) ||
+      !Array.isArray(node.childIds)
+    ) {
+      throw new FamilyValidationError('INVALID_ANALYSIS', 'Ham nöron kimliği, aralığı veya I/R vektörü geçersiz.')
+    }
+    ids.add(node.id)
+  }
+  for (const node of analysis.nodes) {
+    if ((node.parentId && !ids.has(node.parentId)) || node.childIds.some((id) => !ids.has(id))) {
+      throw new FamilyValidationError('INVALID_ANALYSIS', 'Ham nöronun bölünme ağacı eksik düğüm içeriyor.')
+    }
+  }
+  if (!Array.isArray(analysis.rootIds) || analysis.rootIds.length < 1 || analysis.rootIds.some((id) => !ids.has(id))) {
+    throw new FamilyValidationError('INVALID_ANALYSIS', 'Analizin paragraf kökleri eksik veya geçersiz.')
+  }
+  const count = analysis.nodes.length
+  for (let row = 0; row < count; row += 1) {
+    let sum = 0
+    for (let column = 0; column < count; column += 1) {
+      const probability = analysis.habitProbabilities[row * count + column]
+      if (!Number.isFinite(probability) || probability < 0 || probability > 1.000001 || (row === column && probability !== 0)) {
+        throw new FamilyValidationError('INVALID_ANALYSIS', 'Başlangıç H⁰ olasılıklarından biri geçersiz.')
+      }
+      sum += probability
+    }
+    if (sum > 1e-6 && Math.abs(sum - 1) > 1e-4) {
+      throw new FamilyValidationError('INVALID_ANALYSIS', 'Başlangıç H⁰ satırlarından biri normalize değil.')
+    }
+  }
+}
+
+function validateDecision(
+  decision: FamilySynthesisDecisionInput,
+  representationSpaceId: string,
+  identityLength: number,
+  relationLength: number,
+): void {
+  const candidate = decision?.candidate
+  if (
+    !decision || decision.format !== 'noron-sentez-karari' || decision.version !== 1 ||
+    (decision.decision !== 'approved' && decision.decision !== 'rejected') ||
+    typeof decision.candidateFingerprint !== 'string' || !decision.candidateFingerprint ||
+    decision.candidateFingerprint !== candidate?.fingerprint ||
+    decision.representationSpaceId !== candidate?.representationSpaceId ||
+    decision.representationSpaceId !== representationSpaceId ||
+    candidate.identityFrozen !== true ||
+    !finiteVector(candidate.identity, identityLength) ||
+    !finiteVector(candidate.relation, relationLength) ||
+    digestVector(candidate.identity) !== candidate.identityDigest ||
+    !Array.isArray(candidate.independentSupports)
+  ) {
+    throw new FamilyValidationError('INVALID_SYNTHESIS_DECISION', 'Sentez kararı veya dondurulmuş aday kimliği doğrulanamadı.')
+  }
+}
+
+function throwIfCancelled(options: FamilyRunOptions): void {
+  if (options.shouldCancel?.()) throw new FamilyCancelledError()
+}
+
+function translateCancellation<T>(operation: () => T): T {
+  try {
+    return operation()
+  } catch (cause) {
+    if (cause instanceof Error && cause.message === 'FAMILY_CANCELLED') {
+      throw new FamilyCancelledError()
+    }
+    throw cause
+  }
+}
+
+async function yieldToHost(options: FamilyRunOptions): Promise<void> {
+  if (options.yieldControl) await options.yieldControl()
+  else await new Promise<void>((resolve) => setTimeout(resolve, 0))
+  throwIfCancelled(options)
+}
+
+const STAGE_RANGES: Record<FamilyStage, readonly [number, number]> = {
+  validating: [0, 0.06],
+  profiling: [0.06, 0.34],
+  indexing: [0.34, 0.42],
+  clustering: [0.42, 0.59],
+  membership: [0.59, 0.68],
+  transitions: [0.68, 0.78],
+  evaluating: [0.78, 0.91],
+  coalition: [0.91, 0.99],
+  complete: [1, 1],
+}
+
+function report(
+  options: FamilyRunOptions,
+  stage: FamilyStage,
+  completed: number,
+  total: number,
+  message: string,
+  counts: { profiles?: number; families?: number; memberships?: number; transitions?: number } = {},
+): void {
+  const [start, end] = STAGE_RANGES[stage]
+  const local = total <= 0 ? 1 : Math.max(0, Math.min(1, completed / total))
+  options.onProgress?.({
+    stage,
+    completed,
+    total,
+    ratio: start + (end - start) * local,
+    message,
+    profileCount: counts.profiles ?? 0,
+    familyCount: counts.families ?? 0,
+    membershipCount: counts.memberships ?? 0,
+    transitionCount: counts.transitions ?? 0,
+  })
+}
+
+export function createFamilyInputManifest(
+  analyses: readonly FamilyAnalysisInput[],
+  decisions: readonly FamilySynthesisDecisionInput[],
+): FamilyInputManifest {
+  const entries: FamilyInputManifestEntry[] = []
+  for (const analysis of analyses) {
+    const fingerprint = stableDigest([
+      'family-analysis-input-v1',
+      analysis.runId,
+      analysis.sourceDigest,
+      analysis.representationSpaceId,
+      JSON.stringify(analysis.config),
+      analysis.nodes.length,
+      ...analysis.nodes.flatMap((node) => [
+        node.id,
+        node.identityDigest,
+        digestVector(node.relation),
+        node.contextRevision,
+      ]),
+      digestVector(analysis.habitProbabilities),
+    ])
+    entries.push({
+      kind: 'text-lab-analysis',
+      id: analysis.runId,
+      sourceDigest: analysis.sourceDigest,
+      analysisRunId: analysis.runId,
+      representationSpaceId: analysis.representationSpaceId,
+      revision: analysis.createdAt,
+      fingerprint,
+    })
+  }
+  for (const decision of decisions) {
+    const fingerprint = stableDigest([
+      'family-synthesis-input-v1',
+      decision.id,
+      decision.decision,
+      decision.reviewedAt,
+      decision.runFingerprint,
+      decision.candidateFingerprint,
+      decision.candidate.identityDigest,
+      digestVector(decision.candidate.relation),
+    ])
+    entries.push({
+      kind: 'synthesis-decision',
+      id: decision.id,
+      representationSpaceId: decision.representationSpaceId,
+      revision: decision.reviewedAt,
+      fingerprint,
+    })
+  }
+  entries.sort((left, right) => compareText(left.kind, right.kind) || compareText(left.id, right.id))
+  return {
+    entries,
+    corpusFingerprint: stableDigest(['family-corpus-v1', ...entries.flatMap((entry) => [entry.kind, entry.id, entry.revision, entry.fingerprint])]),
+  }
+}
+
+function peakCountBy<T>(items: readonly T[], key: (item: T) => string): number {
+  const counts = new Map<string, number>()
+  let peak = 0
+  for (const item of items) {
+    const id = key(item)
+    const count = (counts.get(id) ?? 0) + 1
+    counts.set(id, count)
+    peak = Math.max(peak, count)
+  }
+  return peak
+}
+
+/** Full deterministic profile -> family -> G -> ablation -> coalition pipeline. */
+export async function runFamilyLearning(
+  input: FamilyRunInput,
+  overrides: Partial<FamilyConfig> = {},
+  options: FamilyRunOptions = {},
+): Promise<FamilyRun> {
+  const config = createFamilyConfig(overrides)
+  throwIfCancelled(options)
+  if (!input.analyses?.length) {
+    throw new FamilyValidationError('EMPTY_INPUT', 'Nöron aileleri için en az bir tamamlanmış Metin Laboratuvarı analizi gerekir.')
+  }
+  report(options, 'validating', 0, input.analyses.length, 'Salt okunur I/R/H⁰ girdileri doğrulanıyor…')
+  const analyses = [...input.analyses].sort((left, right) =>
+    compareText(left.sourceDigest, right.sourceDigest) || compareText(left.runId, right.runId),
+  )
+  analyses.forEach(validateAnalysis)
+  const analysisKeys = new Set<string>()
+  for (const analysis of analyses) {
+    const key = `${analysis.sourceDigest}\u0000${analysis.runId}`
+    if (analysisKeys.has(key)) {
+      throw new FamilyValidationError('INVALID_ANALYSIS', `Aynı analiz aile girdisine iki kez verildi: ${analysis.runId}`)
+    }
+    analysisKeys.add(key)
+  }
+  const representationSpaceId = analyses[0].representationSpaceId
+  if (analyses.some((analysis) => analysis.representationSpaceId !== representationSpaceId)) {
+    throw new FamilyValidationError('REPRESENTATION_SPACE_MISMATCH', 'Farklı I/R temsil uzayları aynı aile deneyinde karıştırılamaz.')
+  }
+  const decisions = (input.synthesisDecisions ?? [])
+    .filter((decision) => decision.representationSpaceId === representationSpaceId)
+    .sort((left, right) => compareText(left.candidateFingerprint, right.candidateFingerprint))
+  const layout = analyses[0].layout
+  decisions.forEach((decision) => validateDecision(
+    decision,
+    representationSpaceId,
+    layout.identityLength,
+    layout.relationLength,
+  ))
+  const decisionKeys = new Set<string>()
+  for (const decision of decisions) {
+    const key = `${decision.id}\u0000${decision.candidateFingerprint}`
+    if (decisionKeys.has(key)) {
+      throw new FamilyValidationError('INVALID_SYNTHESIS_DECISION', `Aynı sentez kararı aile girdisine iki kez verildi: ${decision.id}`)
+    }
+    decisionKeys.add(key)
+  }
+  const approvedDecisions = decisions.filter((decision) => decision.decision === 'approved')
+  const identitySnapshot = snapshotIdentityDigests(analyses)
+  const inputManifest = createFamilyInputManifest(analyses, decisions)
+  const behaviorSpaceId = createBehaviorSpaceId(representationSpaceId, analyses, config)
+  // Replaying the same corpus (for example to inspect a transient coalition)
+  // is not a new developmental observation. Lifecycle promotion requires a
+  // different, compatible corpus snapshot.
+  const previousLearningRun = input.previousRun &&
+    input.previousRun.behaviorSpaceId === behaviorSpaceId &&
+    input.previousRun.inputManifest.corpusFingerprint !== inputManifest.corpusFingerprint
+    ? input.previousRun
+    : null
+  report(options, 'validating', analyses.length, analyses.length, 'Temsil ve arşiv bütünlüğü doğrulandı')
+  await yieldToHost(options)
+
+  const rawNeuronCount = analyses.reduce((sum, analysis) => sum + analysis.nodes.length, 0)
+  report(options, 'profiling', 0, rawNeuronCount, 'Q davranış profilleri çıkarılıyor…')
+  const profileResult = translateCancellation(() => buildBehaviorProfiles(
+    analyses,
+    approvedDecisions,
+    behaviorSpaceId,
+    config,
+    (completed, total) => report(options, 'profiling', completed, total, 'Komşuluk, yapı, H⁰ ve çıkarma izleri Q profiline yazılıyor…', { profiles: completed }),
+    options.shouldCancel,
+  ))
+  assertIdentityUnchanged(analyses, identitySnapshot)
+  report(options, 'profiling', rawNeuronCount, rawNeuronCount, `${profileResult.profiles.length} bounded seyrek Q profili hazır`, { profiles: profileResult.profiles.length })
+  await yieldToHost(options)
+
+  report(options, 'indexing', 0, profileResult.rawProfiles.length, 'Ters özellik indeksi davranış adaylarını sınırlıyor…', { profiles: profileResult.profiles.length })
+  const discovery = translateCancellation(() => discoverFamilies(
+    profileResult.rawProfiles,
+    profileResult.profiles,
+    profileResult.leafMemberKeys,
+    config,
+    previousLearningRun,
+    options.shouldCancel,
+  ))
+  report(options, 'indexing', profileResult.rawProfiles.length, profileResult.rawProfiles.length, `${discovery.edges.length} seyrek davranış bağı tutuldu`, {
+    profiles: profileResult.profiles.length,
+    families: discovery.families.length,
+  })
+  report(options, 'clustering', discovery.edges.length, discovery.edges.length, `${discovery.families.length} complete-link aile adayı doğdu`, {
+    profiles: profileResult.profiles.length,
+    families: discovery.families.length,
+  })
+  report(options, 'membership', discovery.memberships.length, discovery.memberships.length, `${discovery.memberships.length} top-k yumuşak M üyeliği hazır`, {
+    profiles: profileResult.profiles.length,
+    families: discovery.families.length,
+    memberships: discovery.memberships.length,
+  })
+  await yieldToHost(options)
+
+  report(options, 'transitions', 0, analyses.length, 'Nöron H⁰ önseli aile düzeyindeki seyrek G kanıtına toplanıyor…', {
+    profiles: profileResult.profiles.length,
+    families: discovery.families.length,
+    memberships: discovery.memberships.length,
+  })
+  const availableMemberKeys = new Set(profileResult.profiles.map((profile) => profile.memberKey))
+  const neuronTransitions = translateCancellation(() => buildSparseNeuronTransitions(
+    analyses,
+    availableMemberKeys,
+    config,
+    options.shouldCancel,
+  ))
+  const transitionResult = buildFamilyTransitions(
+    neuronTransitions,
+    profileResult.profiles,
+    discovery.families,
+    discovery.memberships,
+    config,
+  )
+  report(options, 'transitions', analyses.length, analyses.length, `${transitionResult.familyTransitions.length} bounded aile geçişi hazır`, {
+    profiles: profileResult.profiles.length,
+    families: discovery.families.length,
+    memberships: discovery.memberships.length,
+    transitions: transitionResult.familyTransitions.length,
+  })
+  await yieldToHost(options)
+
+  report(options, 'evaluating', 0, discovery.families.length, 'Aileler kaynak-holdout karşı-olgusal susturma testine giriyor…', {
+    profiles: profileResult.profiles.length,
+    families: discovery.families.length,
+    memberships: discovery.memberships.length,
+    transitions: transitionResult.familyTransitions.length,
+  })
+  const utilityReports = translateCancellation(() => measureFamilyAblationUtilities(
+    analyses,
+    discovery.families,
+    discovery.memberships,
+    config,
+    options.shouldCancel,
+    (completed, total) => report(options, 'evaluating', completed, total, 'Full model ile aile-susturulmuş model aynı aday evreninde karşılaştırılıyor…', {
+      profiles: profileResult.profiles.length,
+      families: discovery.families.length,
+      memberships: discovery.memberships.length,
+      transitions: transitionResult.familyTransitions.length,
+    }),
+  ))
+  const families = applyUtilityLifecycle(discovery.families, utilityReports, config)
+  await yieldToHost(options)
+
+  report(options, 'coalition', 0, 1, 'Runtime aktivasyonlarından geçici olay koalisyonları kuruluyor…', {
+    profiles: profileResult.profiles.length,
+    families: families.length,
+    memberships: discovery.memberships.length,
+    transitions: transitionResult.familyTransitions.length,
+  })
+  const coalitionResult = buildEventCoalitions(
+    input.activations ?? [],
+    profileResult.profiles,
+    families,
+    discovery.memberships,
+    transitionResult.familyTransitions,
+    config,
+    input.previousRun?.coalition,
+  )
+  const activations = [...(input.activations ?? [])]
+    .filter((activation) => Number.isFinite(activation.activation) && activation.activation > 0)
+    .sort((left, right) => right.activation - left.activation || compareText(left.memberKey, right.memberKey))
+    .slice(0, config.maximumActiveNeurons)
+  const current = activations[0]
+  const routingPreview = current
+    ? computeRouteDistribution(
+        current.memberKey,
+        profileResult.profiles,
+        discovery.memberships,
+        transitionResult.neuronTransitions,
+        transitionResult.familyTransitions,
+        config,
+        {
+          candidateMemberKeys: new Set(activations.slice(1).map((activation) => activation.memberKey)),
+          signalCompatibility: new Map(activations.map((activation) => [activation.memberKey, activation.activation])),
+          repetition: new Map(activations.map((activation) => [activation.memberKey, activation.repetition ?? 0])),
+        },
+      )
+    : null
+  report(options, 'coalition', 1, 1, `${coalitionResult.state.coalitions.length} geçici olay koalisyonu etkin`, {
+    profiles: profileResult.profiles.length,
+    families: families.length,
+    memberships: discovery.memberships.length,
+    transitions: transitionResult.familyTransitions.length,
+  })
+
+  assertIdentityUnchanged(analyses, identitySnapshot)
+  const warnings: string[] = [
+    'İçerik, olay, rol ve operatör bölgeleri statik davranış hipotezidir; insan anlamı veya doğruluk kanıtı değildir.',
+    'Amaç, dil ve kontrol bölgeleri runtime/expected-output deneyimi gelene kadar doğrulanmamış ve dormant kalır.',
+    'Metin Laboratuvarı H⁰ değerleri yaşanmış kas hafızası değil, benzerlikten türetilmiş başlangıç önselidir.',
+  ]
+  const transitionSemantics = new Set(analyses.map((analysis) => `${analysis.config.identitySimilarityWeight}:${analysis.config.habitExponent}`))
+  if (transitionSemantics.size > 1) warnings.push('Seçili analizlerin H⁰ ayarları farklı; davranış uzayı bu farkı parmak izine dahil etti.')
+  if (!families.length) warnings.push('Seçili eşiklerle bağımsız ve complete-link uyumlu aile oluşmadı.')
+  if (approvedDecisions.length > profileResult.synthesisProfiles.length) {
+    warnings.push(`${approvedDecisions.length - profileResult.synthesisProfiles.length} onaylı sentez adayı, ham destek profili bulunamadığı için aile deneyine katılamadı.`)
+  }
+  const fingerprint = stableDigest([
+    'family-run-v1',
+    inputManifest.corpusFingerprint,
+    behaviorSpaceId,
+    JSON.stringify(config),
+    profilesFingerprint(profileResult.profiles),
+    ...families.map((family) => family.fingerprint),
+    ...discovery.memberships.flatMap((membership) => [membership.memberKey, membership.familyId, Math.fround(membership.weight)]),
+    ...transitionResult.familyTransitions.flatMap((transition) => [transition.fromFamilyId, transition.toFamilyId, Math.fround(transition.probability)]),
+  ])
+  const run: FamilyRun = {
+    format: 'noron-aileleri-run',
+    version: 1,
+    id: `FR-${fingerprint.slice(0, 16)}`,
+    fingerprint,
+    createdAt: new Date().toISOString(),
+    representationSpaceId,
+    behaviorSpaceId,
+    config: { ...config },
+    inputManifest,
+    profiles: profileResult.profiles,
+    families,
+    memberships: discovery.memberships,
+    neuronTransitions: transitionResult.neuronTransitions,
+    familyTransitions: transitionResult.familyTransitions,
+    utilityReports,
+    coalition: coalitionResult.state,
+    routingPreview,
+    warnings,
+    stats: {
+      inputAnalysisCount: analyses.length,
+      approvedSynthesisCount: profileResult.synthesisProfiles.length,
+      distinctSourceCount: new Set(analyses.map((analysis) => analysis.sourceDigest)).size,
+      rawNeuronCount,
+      profileCount: profileResult.profiles.length,
+      profileFeatureCount: profileResult.profiles.reduce((sum, profile) => sum + profile.vector.entries.length, 0),
+      candidateComparisonCount: discovery.stats.candidateComparisonCount,
+      retainedBehaviorEdgeCount: discovery.stats.retainedBehaviorEdgeCount,
+      familyCount: families.length,
+      membershipCount: discovery.memberships.length,
+      peakMembershipsPerNeuron: peakCountBy(discovery.memberships, (membership) => membership.memberKey),
+      retainedFamilyTransitionCount: transitionResult.familyTransitions.length,
+      peakOutgoingFamilyTransitions: peakCountBy(transitionResult.familyTransitions, (transition) => transition.fromFamilyId),
+      utilityCaseCount: familyUtilityCaseCount(utilityReports),
+      coalitionExpansionCount: coalitionResult.expansionCount,
+      peakCoalitionBeamWidth: coalitionResult.peakBeamWidth,
+    },
+  }
+  report(options, 'complete', 1, 1, `${families.length} aile, ${run.coalition.coalitions.length} geçici koalisyon ve held-out fayda raporu hazır`, {
+    profiles: run.profiles.length,
+    families: run.families.length,
+    memberships: run.memberships.length,
+    transitions: run.familyTransitions.length,
+  })
+  return run
+}
+
+export const learnNeuronFamilies = runFamilyLearning
