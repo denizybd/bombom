@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_TEXT_LAB_CONFIG } from '../domain/config'
+import {
+  ADAPTIVE_TEXT_LAB_PROFILE_ID,
+  DEFAULT_TEXT_LAB_CONFIG,
+  createTextLabConfigForProfile,
+} from '../domain/config'
 import { analyzeText } from './pipeline'
 import { applyContextObservation } from './context'
 import { cosineRegion } from './matrix'
@@ -173,5 +177,30 @@ describe('raw text pipeline', () => {
     )
     expect(Array.from(first.similarities)).toEqual(Array.from(second.similarities))
     expect(Array.from(first.habitProbabilities)).toEqual(Array.from(second.habitProbabilities))
+  })
+
+  it('builds a deterministic opt-in 8/56 analysis without changing the legacy default', async () => {
+    const adaptive = createTextLabConfigForProfile(ADAPTIVE_TEXT_LAB_PROFILE_ID, {
+      minimumLeafGraphemes: 6,
+    })
+    const source = {
+      id: 'source-adaptive-profile',
+      title: 'Uyarlanabilir temsil',
+      rawText: 'Aynı fiziksel sayfalar, farklı öğrenilmiş işlevler taşıyabilir.',
+    }
+    const first = await analyzeText(source, adaptive, { yieldEveryPairs: 100_000 })
+    const second = await analyzeText(source, adaptive, { yieldEveryPairs: 100_000 })
+
+    expect(first.layout.identityLength).toBe(512)
+    expect(first.layout.relationLength).toBe(3_584)
+    expect(first.representationSpaceId).toBe(second.representationSpaceId)
+    expect(first.nodes.map((node) => node.identityDigest)).toEqual(
+      second.nodes.map((node) => node.identityDigest),
+    )
+    expect(first.representationSpaceId).not.toBe(
+      (await analyzeText(source, DEFAULT_TEXT_LAB_CONFIG, {
+        yieldEveryPairs: 100_000,
+      })).representationSpaceId,
+    )
   })
 })

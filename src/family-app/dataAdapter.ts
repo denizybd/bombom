@@ -48,6 +48,7 @@ export function toFamilyAnalysisInput(analysis: TextLabAnalysis): FamilyAnalysis
     version: analysis.version,
     runId: analysis.runId,
     createdAt: analysis.createdAt,
+    independenceGroupId: analysis.independenceGroupId,
     sourceDigest: analysis.sourceDigest,
     identitySpaceId: analysis.identitySpaceId,
     contextSpaceId: analysis.contextSpaceId,
@@ -106,9 +107,11 @@ export function createFamilyRunInput(
   decisions: readonly SynthesisArchiveRecord[],
   previousRun: FamilyRunInput['previousRun'] = null,
   activations: FamilyRunInput['activations'] = undefined,
+  dataSplit: Pick<FamilyRunInput, 'discoveryIndependenceGroupIds' | 'evaluationIndependenceGroupIds'> = {},
 ): FamilyRunInput {
   return {
     analyses: analyses.map(toFamilyAnalysisInput),
+    ...dataSplit,
     synthesisDecisions: decisions
       .filter((record) => record.decision === 'approved')
       .map(toFamilySynthesisDecisionInput),

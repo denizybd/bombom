@@ -11,11 +11,13 @@ import type {
 } from './types'
 import { profileSimilarity, rawMemberKey } from './profile'
 import { FAMILY_EPSILON, clamp, compareText, stableDigest } from './sparse'
+import { createIndependentSourceIndex } from './independence'
+import type { IndependentSourceIndex } from './independence'
 
 interface TransitionEvidence {
   priorEvidence: number
   supportKeys: Set<string>
-  sourceDigests: Set<string>
+  sourceIds: Set<string>
 }
 
 export interface FamilyTransitionBuildResult {
@@ -112,8 +114,12 @@ export function buildSparseNeuronTransitions(
   )
 }
 
-function sourceForProfile(profile: BehaviorProfile | undefined): string {
-  return profile?.evidence[0]?.sourceDigest ?? ''
+function sourceForProfile(
+  profile: BehaviorProfile | undefined,
+  sourceIndex: IndependentSourceIndex,
+): string {
+  const evidence = profile?.evidence[0]
+  return evidence ? sourceIndex.groupKey(evidence) : ''
 }
 
 /**
@@ -129,13 +135,17 @@ export function buildFamilyTransitions(
   config: FamilyConfig,
 ): FamilyTransitionBuildResult {
   const profileByKey = new Map(profiles.map((profile) => [profile.memberKey, profile]))
+  const sourceIndex = createIndependentSourceIndex(profiles.flatMap((profile) => profile.evidence))
   const byMember = membershipIndex(memberships)
   const familyIds = new Set(families.map((family) => family.id))
   const bySource = new Map<string, Map<string, TransitionEvidence>>()
 
   for (const transition of neuronTransitions) {
-    const sourceDigest = sourceForProfile(profileByKey.get(transition.fromMemberKey))
-    if (!sourceDigest || sourceDigest !== sourceForProfile(profileByKey.get(transition.toMemberKey))) continue
+    const sourceId = sourceForProfile(profileByKey.get(transition.fromMemberKey), sourceIndex)
+    if (
+      !sourceId ||
+      sourceId !== sourceForProfile(profileByKey.get(transition.toMemberKey), sourceIndex)
+    ) continue
     const fromMemberships = byMember.get(transition.fromMemberKey) ?? []
     const toMemberships = byMember.get(transition.toMemberKey) ?? []
     for (const from of fromMemberships) {
@@ -145,17 +155,17 @@ export function buildFamilyTransitions(
         const contribution = transition.probability * from.weight * to.weight
         if (contribution <= FAMILY_EPSILON) continue
         const pair = `${from.familyId}\u0000${to.familyId}`
-        const sourceMap = bySource.get(sourceDigest) ?? new Map<string, TransitionEvidence>()
+        const sourceMap = bySource.get(sourceId) ?? new Map<string, TransitionEvidence>()
         const evidence = sourceMap.get(pair) ?? {
           priorEvidence: 0,
           supportKeys: new Set<string>(),
-          sourceDigests: new Set<string>(),
+          sourceIds: new Set<string>(),
         }
         evidence.priorEvidence += contribution
         evidence.supportKeys.add(`${transition.fromMemberKey}\u0001${transition.toMemberKey}`)
-        evidence.sourceDigests.add(sourceDigest)
+        evidence.sourceIds.add(sourceId)
         sourceMap.set(pair, evidence)
-        bySource.set(sourceDigest, sourceMap)
+        bySource.set(sourceId, sourceMap)
       }
     }
   }
@@ -175,16 +185,16 @@ export function buildFamilyTransitions(
   }
 
   const combined = new Map<string, TransitionEvidence>()
-  for (const [sourceDigest, sourceMap] of bySource) {
+  for (const [sourceId, sourceMap] of bySource) {
     for (const [pair, sourceEvidence] of sourceMap) {
       const evidence = combined.get(pair) ?? {
         priorEvidence: 0,
         supportKeys: new Set<string>(),
-        sourceDigests: new Set<string>(),
+        sourceIds: new Set<string>(),
       }
       evidence.priorEvidence += sourceEvidence.priorEvidence
       sourceEvidence.supportKeys.forEach((key) => evidence.supportKeys.add(key))
-      evidence.sourceDigests.add(sourceDigest)
+      evidence.sourceIds.add(sourceId)
       combined.set(pair, evidence)
     }
   }
@@ -198,10 +208,10 @@ export function buildFamilyTransitions(
       id: `FG-${fingerprint.slice(0, 16)}`,
       fromFamilyId,
       toFamilyId,
-      priorEvidence: evidence.priorEvidence / Math.max(1, evidence.sourceDigests.size),
+      priorEvidence: evidence.priorEvidence / Math.max(1, evidence.sourceIds.size),
       experienceEvidence: 0,
       inhibitionEvidence: 0,
-      sourceCount: evidence.sourceDigests.size,
+      sourceCount: evidence.sourceIds.size,
       supportCount: evidence.supportKeys.size,
       probability: 0,
     }

@@ -17,7 +17,12 @@ import {
   profilesFingerprint,
   snapshotIdentityDigests,
 } from './profile'
-import { applyUtilityLifecycle, familyUtilityCaseCount, measureFamilyAblationUtilities } from './utility'
+import {
+  applyUtilityLifecycle,
+  familyUtilityCaseCount,
+  measureFamilyAblationUtilities,
+  measureFamilyAblationUtilitiesOnEvaluation,
+} from './utility'
 import {
   buildFamilyTransitions,
   buildSparseNeuronTransitions,
@@ -27,6 +32,7 @@ import { buildEventCoalitions } from './coalition'
 import type {
   FamilyAnalysisInput,
   FamilyConfig,
+  FamilyDataSplitManifest,
   FamilyInputManifest,
   FamilyInputManifestEntry,
   FamilyProgress,
@@ -37,6 +43,7 @@ import type {
   FamilySynthesisDecisionInput,
 } from './types'
 import { compareText, stableDigest } from './sparse'
+import { createIndependentSourceIndex } from './independence'
 
 export const DEFAULT_FAMILY_CONFIG: Readonly<FamilyConfig> = Object.freeze({
   profileDimension: 256,
@@ -46,7 +53,12 @@ export const DEFAULT_FAMILY_CONFIG: Readonly<FamilyConfig> = Object.freeze({
   maximumIndexBucketSize: 128,
   maximumCandidateNeighbors: 24,
   maximumFamilyMembers: 64,
-  maximumFamilies: 128,
+  // Family formation is bounded by independent evidence and the number of
+  // seed profiles.  A fixed product-wide ceiling used to truncate this list
+  // at 128, making a larger corpus look as if it had stopped developing.
+  // Keep the field for explicit experiment budgets, but make the default
+  // effectively unbounded by an arbitrary family count.
+  maximumFamilies: Number.MAX_SAFE_INTEGER,
   maximumMembershipsPerNeuron: 5,
   minimumFormationSimilarity: 0.48,
   minimumMembershipScore: 0.34,
@@ -79,6 +91,7 @@ type FamilyValidationCode =
   | 'EMPTY_INPUT'
   | 'INVALID_CONFIG'
   | 'INVALID_ANALYSIS'
+  | 'INVALID_DATA_SPLIT'
   | 'REPRESENTATION_SPACE_MISMATCH'
   | 'INVALID_SYNTHESIS_DECISION'
   | 'CANCELLED'
@@ -178,6 +191,11 @@ function validateAnalysis(analysis: FamilyAnalysisInput): void {
     analysis.format !== 'metin-laboratuvari-analysis' ||
     analysis.version !== 2 ||
     typeof analysis.runId !== 'string' || !analysis.runId ||
+    (analysis.independenceGroupId !== undefined && (
+      typeof analysis.independenceGroupId !== 'string' ||
+      !analysis.independenceGroupId.trim() ||
+      analysis.independenceGroupId.includes('\u0000')
+    )) ||
     typeof analysis.sourceDigest !== 'string' || !analysis.sourceDigest ||
     typeof analysis.representationSpaceId !== 'string' || !analysis.representationSpaceId ||
     !analysis.source || !analysis.config || !analysis.layout ||
@@ -356,12 +374,14 @@ function report(
 export function createFamilyInputManifest(
   analyses: readonly FamilyAnalysisInput[],
   decisions: readonly FamilySynthesisDecisionInput[],
+  dataSplit?: FamilyDataSplitManifest,
 ): FamilyInputManifest {
   const entries: FamilyInputManifestEntry[] = []
   for (const analysis of analyses) {
     const fingerprint = stableDigest([
       'family-analysis-input-v1',
       analysis.runId,
+      analysis.independenceGroupId ?? '',
       analysis.sourceDigest,
       analysis.representationSpaceId,
       JSON.stringify(analysis.config),
@@ -406,7 +426,157 @@ export function createFamilyInputManifest(
   entries.sort((left, right) => compareText(left.kind, right.kind) || compareText(left.id, right.id))
   return {
     entries,
-    corpusFingerprint: stableDigest(['family-corpus-v1', ...entries.flatMap((entry) => [entry.kind, entry.id, entry.revision, entry.fingerprint])]),
+    corpusFingerprint: stableDigest([
+      'family-corpus-v1',
+      ...entries.flatMap((entry) => [entry.kind, entry.id, entry.revision, entry.fingerprint]),
+      ...(dataSplit ? ['split-v1', JSON.stringify(dataSplit)] : []),
+    ]),
+    ...(dataSplit ? { dataSplit } : {}),
+  }
+}
+
+interface ResolvedFamilyDataSplit {
+  explicit: boolean
+  discoveryAnalyses: FamilyAnalysisInput[]
+  evaluationAnalyses: FamilyAnalysisInput[]
+  projectionOnlyAnalyses: FamilyAnalysisInput[]
+  manifest?: FamilyDataSplitManifest
+  warnings: string[]
+}
+
+function normalizedGroupIds(
+  value: readonly string[] | undefined,
+  label: string,
+): string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) {
+    throw new FamilyValidationError('INVALID_DATA_SPLIT', `${label} bağımsız kaynak grupları bir dizi olmalıdır.`)
+  }
+  const result = new Set<string>()
+  for (const item of value) {
+    const normalized = typeof item === 'string' ? item.trim() : ''
+    if (!normalized || normalized.includes('\u0000')) {
+      throw new FamilyValidationError('INVALID_DATA_SPLIT', `${label} bağımsız kaynak gruplarından biri geçersiz.`)
+    }
+    result.add(normalized)
+  }
+  return [...result].sort(compareText)
+}
+
+function analysisGroupId(analysis: FamilyAnalysisInput): string {
+  return analysis.independenceGroupId?.trim() ?? ''
+}
+
+function resolveFamilyDataSplit(
+  analyses: readonly FamilyAnalysisInput[],
+  input: FamilyRunInput,
+): ResolvedFamilyDataSplit {
+  const requestedDiscovery = normalizedGroupIds(
+    input.discoveryIndependenceGroupIds,
+    'Keşif/eğitim',
+  )
+  const requestedEvaluation = normalizedGroupIds(
+    input.evaluationIndependenceGroupIds,
+    'Değerlendirme',
+  )
+  const explicit = requestedDiscovery !== undefined || requestedEvaluation !== undefined
+  if (!explicit) {
+    return {
+      explicit: false,
+      discoveryAnalyses: [...analyses],
+      evaluationAnalyses: [...analyses],
+      projectionOnlyAnalyses: [],
+      warnings: [],
+    }
+  }
+
+  const discoveryIds = new Set(requestedDiscovery ?? [])
+  const evaluationIds = new Set(requestedEvaluation ?? [])
+  for (const groupId of discoveryIds) {
+    if (evaluationIds.has(groupId)) {
+      throw new FamilyValidationError(
+        'INVALID_DATA_SPLIT',
+        `Aynı bağımsız kaynak grubu keşif ve değerlendirme bölümlerinde kullanılamaz: ${groupId}`,
+      )
+    }
+  }
+
+  const discoveryAnalyses = requestedDiscovery !== undefined
+    ? analyses.filter((analysis) => discoveryIds.has(analysisGroupId(analysis)))
+    : analyses.filter((analysis) => !evaluationIds.has(analysisGroupId(analysis)))
+  const evaluationAnalyses = requestedEvaluation !== undefined
+    ? analyses.filter((analysis) => evaluationIds.has(analysisGroupId(analysis)))
+    : []
+  if (!discoveryAnalyses.length) {
+    throw new FamilyValidationError(
+      'INVALID_DATA_SPLIT',
+      'Bildirilmiş keşif/eğitim kaynak grupları hiçbir analizle eşleşmedi; sızıntıyı önlemek için tüm-korpus geri dönüşü yapılmadı.',
+    )
+  }
+
+  // A copied chunk or shared provenance lineage can bridge two differently
+  // named declarations. Resolve that transitive equivalence before allowing a
+  // split, otherwise the same physical evidence appears on both sides.
+  if (evaluationAnalyses.length) {
+    const sourceIndex = createIndependentSourceIndex(analyses.map((analysis) => ({
+      independenceGroupId: analysis.independenceGroupId,
+      sourceId: analysis.source.id,
+      sourceDigest: analysis.sourceDigest,
+    })))
+    const discoveryGroups = new Set(discoveryAnalyses.map((analysis) => sourceIndex.groupKey({
+      independenceGroupId: analysis.independenceGroupId,
+      sourceId: analysis.source.id,
+      sourceDigest: analysis.sourceDigest,
+    })))
+    const overlap = new Set(evaluationAnalyses.map((analysis) => sourceIndex.groupKey({
+      independenceGroupId: analysis.independenceGroupId,
+      sourceId: analysis.source.id,
+      sourceDigest: analysis.sourceDigest,
+    })).filter((group) => discoveryGroups.has(group)))
+    if (overlap.size) {
+      throw new FamilyValidationError(
+        'INVALID_DATA_SPLIT',
+        'Keşif ve değerlendirme kümeleri kopya içerik, ortak kaynak kimliği veya ortak üretim soyu üzerinden kesişiyor.',
+      )
+    }
+  }
+
+  const discoveryRunIds = new Set(discoveryAnalyses.map((analysis) => analysis.runId))
+  const evaluationRunIds = new Set(evaluationAnalyses.map((analysis) => analysis.runId))
+  const projectionOnlyAnalyses = analyses.filter((analysis) => (
+    !discoveryRunIds.has(analysis.runId) && !evaluationRunIds.has(analysis.runId)
+  ))
+  const availableGroupIds = new Set(analyses.map(analysisGroupId).filter(Boolean))
+  const missingDiscovery = (requestedDiscovery ?? []).filter((group) => !availableGroupIds.has(group))
+  const missingEvaluation = (requestedEvaluation ?? []).filter((group) => !availableGroupIds.has(group))
+  const utilityFallback = evaluationAnalyses.length ? 'none' : 'discovery-source-holdout'
+  const warnings: string[] = []
+  if (missingDiscovery.length) {
+    warnings.push(`${missingDiscovery.length} bildirilmiş keşif/eğitim kaynak grubu mevcut analizlerde bulunamadı.`)
+  }
+  if (missingEvaluation.length) {
+    warnings.push(`${missingEvaluation.length} bildirilmiş değerlendirme kaynak grubu mevcut analizlerde bulunamadı.`)
+  }
+  if (utilityFallback !== 'none') {
+    warnings.push('Ayrı değerlendirme analizi bulunamadı; fayda yalnız keşif korpusu içindeki kaynak-holdout tanısı olarak hesaplandı ve dış holdout kanıtı sayılmamalıdır.')
+  }
+  const manifest: FamilyDataSplitManifest = {
+    mode: 'declared-independent-groups',
+    discoveryCorpusFingerprint: createFamilyInputManifest(discoveryAnalyses, []).corpusFingerprint,
+    discoveryIndependenceGroupIds: requestedDiscovery ?? [...new Set(discoveryAnalyses.map(analysisGroupId).filter(Boolean))].sort(compareText),
+    evaluationIndependenceGroupIds: requestedEvaluation ?? [],
+    discoveryAnalysisRunIds: [...discoveryRunIds].sort(compareText),
+    evaluationAnalysisRunIds: [...evaluationRunIds].sort(compareText),
+    projectionOnlyAnalysisRunIds: projectionOnlyAnalyses.map((analysis) => analysis.runId).sort(compareText),
+    utilityFallback,
+  }
+  return {
+    explicit: true,
+    discoveryAnalyses,
+    evaluationAnalyses,
+    projectionOnlyAnalyses,
+    manifest,
+    warnings,
   }
 }
 
@@ -469,17 +639,32 @@ export async function runFamilyLearning(
     decisionKeys.add(key)
   }
   const approvedDecisions = decisions.filter((decision) => decision.decision === 'approved')
+  const dataSplit = resolveFamilyDataSplit(analyses, input)
+  const discoveryAnalyses = dataSplit.discoveryAnalyses
+  const independentSources = createIndependentSourceIndex(discoveryAnalyses.map((analysis) => ({
+    independenceGroupId: analysis.independenceGroupId,
+    sourceId: analysis.source.id,
+    sourceDigest: analysis.sourceDigest,
+  })))
   const identitySnapshot = snapshotIdentityDigests(analyses)
-  const inputManifest = createFamilyInputManifest(analyses, decisions)
-  const behaviorSpaceId = createBehaviorSpaceId(representationSpaceId, analyses, config)
+  const inputManifest = createFamilyInputManifest(analyses, decisions, dataSplit.manifest)
+  // Evaluation-only configuration must not rename the learned behavior space.
+  // All profiles are projected into the discovery-defined space below.
+  const behaviorSpaceId = createBehaviorSpaceId(representationSpaceId, discoveryAnalyses, config)
   // Replaying the same corpus (for example to inspect a transient coalition)
   // is not a new developmental observation. Lifecycle promotion requires a
   // different, compatible corpus snapshot.
   const previousLearningRun = input.previousRun &&
     input.previousRun.behaviorSpaceId === behaviorSpaceId &&
-    input.previousRun.inputManifest.corpusFingerprint !== inputManifest.corpusFingerprint
-    ? input.previousRun
-    : null
+    (
+      input.previousRun.inputManifest.dataSplit?.discoveryCorpusFingerprint ??
+      input.previousRun.inputManifest.corpusFingerprint
+    ) !== (
+      inputManifest.dataSplit?.discoveryCorpusFingerprint ??
+      inputManifest.corpusFingerprint
+    )
+      ? input.previousRun
+      : null
   report(options, 'validating', analyses.length, analyses.length, 'Temsil ve arşiv bütünlüğü doğrulandı')
   await yieldToHost(options)
 
@@ -498,10 +683,18 @@ export async function runFamilyLearning(
   await yieldToHost(options)
 
   report(options, 'indexing', 0, profileResult.rawProfiles.length, 'Ters özellik indeksi davranış adaylarını sınırlıyor…', { profiles: profileResult.profiles.length })
+  const discoveryRunIds = new Set(discoveryAnalyses.map((analysis) => analysis.runId))
+  const discoveryRawProfiles = profileResult.rawProfiles.filter((profile) => (
+    profile.evidence.some((evidence) => discoveryRunIds.has(evidence.analysisRunId))
+  ))
+  const discoveryMemberKeys = new Set(discoveryRawProfiles.map((profile) => profile.memberKey))
+  const discoveryLeafMemberKeys = new Set(
+    [...profileResult.leafMemberKeys].filter((memberKey) => discoveryMemberKeys.has(memberKey)),
+  )
   const discovery = translateCancellation(() => discoverFamilies(
-    profileResult.rawProfiles,
+    discoveryRawProfiles,
     profileResult.profiles,
-    profileResult.leafMemberKeys,
+    discoveryLeafMemberKeys,
     config,
     previousLearningRun,
     options.shouldCancel,
@@ -521,26 +714,26 @@ export async function runFamilyLearning(
   })
   await yieldToHost(options)
 
-  report(options, 'transitions', 0, analyses.length, 'Nöron H⁰ önseli aile düzeyindeki seyrek G kanıtına toplanıyor…', {
+  report(options, 'transitions', 0, discoveryAnalyses.length, 'Yalnız keşif/eğitim H⁰ önseli aile düzeyindeki seyrek G kanıtına toplanıyor…', {
     profiles: profileResult.profiles.length,
     families: discovery.families.length,
     memberships: discovery.memberships.length,
   })
-  const availableMemberKeys = new Set(profileResult.profiles.map((profile) => profile.memberKey))
+  const discoveryMemberships = discovery.memberships.filter((membership) => discoveryMemberKeys.has(membership.memberKey))
   const neuronTransitions = translateCancellation(() => buildSparseNeuronTransitions(
-    analyses,
-    availableMemberKeys,
+    discoveryAnalyses,
+    discoveryMemberKeys,
     config,
     options.shouldCancel,
   ))
   const transitionResult = buildFamilyTransitions(
     neuronTransitions,
-    profileResult.profiles,
+    discoveryRawProfiles,
     discovery.families,
-    discovery.memberships,
+    discoveryMemberships,
     config,
   )
-  report(options, 'transitions', analyses.length, analyses.length, `${transitionResult.familyTransitions.length} bounded aile geçişi hazır`, {
+  report(options, 'transitions', discoveryAnalyses.length, discoveryAnalyses.length, `${transitionResult.familyTransitions.length} bounded aile geçişi hazır`, {
     profiles: profileResult.profiles.length,
     families: discovery.families.length,
     memberships: discovery.memberships.length,
@@ -554,19 +747,51 @@ export async function runFamilyLearning(
     memberships: discovery.memberships.length,
     transitions: transitionResult.familyTransitions.length,
   })
-  const utilityReports = translateCancellation(() => measureFamilyAblationUtilities(
-    analyses,
-    discovery.families,
-    discovery.memberships,
-    config,
-    options.shouldCancel,
-    (completed, total) => report(options, 'evaluating', completed, total, 'Full model ile aile-susturulmuş model aynı aday evreninde karşılaştırılıyor…', {
+  const utilityProgress = (completed: number, total: number) => report(
+    options,
+    'evaluating',
+    completed,
+    total,
+    dataSplit.explicit && dataSplit.evaluationAnalyses.length
+      ? 'Keşifte öğrenilen model ile aile-susturulmuş model ayrı değerlendirme aday evreninde karşılaştırılıyor…'
+      : 'Full model ile aile-susturulmuş model aynı aday evreninde karşılaştırılıyor…',
+    {
       profiles: profileResult.profiles.length,
       families: discovery.families.length,
       memberships: discovery.memberships.length,
       transitions: transitionResult.familyTransitions.length,
-    }),
+    },
+  )
+  const measuredUtilityReports = translateCancellation(() => (
+    dataSplit.explicit && dataSplit.evaluationAnalyses.length
+      ? measureFamilyAblationUtilitiesOnEvaluation(
+          discoveryAnalyses,
+          dataSplit.evaluationAnalyses,
+          discovery.families,
+          discovery.memberships,
+          config,
+          options.shouldCancel,
+          utilityProgress,
+        )
+      : measureFamilyAblationUtilities(
+          discoveryAnalyses,
+          discovery.families,
+          discovery.memberships,
+          config,
+          options.shouldCancel,
+          utilityProgress,
+        )
   ))
+  // An explicitly requested split without evaluation data may still expose a
+  // useful within-discovery diagnostic, but it must never unlock lifecycle
+  // promotion as though an external holdout had passed.
+  const utilityReports = dataSplit.explicit && !dataSplit.evaluationAnalyses.length
+    ? measuredUtilityReports.map((report) => ({
+        ...report,
+        status: 'insufficient-evidence' as const,
+        explanation: `Ayrı değerlendirme korpusu bulunmadı; yalnız tanısal değer hesaplandı. ${report.explanation}`,
+      }))
+    : measuredUtilityReports
   const families = applyUtilityLifecycle(discovery.families, utilityReports, config)
   await yieldToHost(options)
 
@@ -617,10 +842,19 @@ export async function runFamilyLearning(
     'İçerik, olay, rol ve operatör bölgeleri statik davranış hipotezidir; insan anlamı veya doğruluk kanıtı değildir.',
     'Amaç, dil ve kontrol bölgeleri runtime/expected-output deneyimi gelene kadar doğrulanmamış ve dormant kalır.',
     'Metin Laboratuvarı H⁰ değerleri yaşanmış kas hafızası değil, benzerlikten türetilmiş başlangıç önselidir.',
+    ...dataSplit.warnings,
   ]
-  const transitionSemantics = new Set(analyses.map((analysis) => `${analysis.config.identitySimilarityWeight}:${analysis.config.habitExponent}`))
+  const declaredSourceCount = new Set(discoveryAnalyses.map((analysis) => analysis.source.id)).size
+  if (independentSources.groupCount < declaredSourceCount) {
+    warnings.push(`${declaredSourceCount - independentSources.groupCount} kaynak kimliği; yeniden adlandırılmış içerik kopyası veya ortak üretim soyu olduğu için bağımsız kaynak desteği sayılmadı.`)
+  }
+  const transitionSemantics = new Set(discoveryAnalyses.map((analysis) => `${analysis.config.identitySimilarityWeight}:${analysis.config.habitExponent}`))
   if (transitionSemantics.size > 1) warnings.push('Seçili analizlerin H⁰ ayarları farklı; davranış uzayı bu farkı parmak izine dahil etti.')
   if (!families.length) warnings.push('Seçili eşiklerle bağımsız ve complete-link uyumlu aile oluşmadı.')
+  const unknownRegionCount = families.filter((family) => family.region === 'unknown').length
+  if (unknownRegionCount) {
+    warnings.push(`${unknownRegionCount} ailede statik bölge puanı veya ilk iki hipotez farkı yetersiz kaldı; semantik etiket yerine “belirsiz” korundu.`)
+  }
   if (approvedDecisions.length > profileResult.synthesisProfiles.length) {
     warnings.push(`${approvedDecisions.length - profileResult.synthesisProfiles.length} onaylı sentez adayı, ham destek profili bulunamadığı için aile deneyine katılamadı.`)
   }
@@ -655,8 +889,13 @@ export async function runFamilyLearning(
     warnings,
     stats: {
       inputAnalysisCount: analyses.length,
+      ...(dataSplit.explicit ? {
+        discoveryAnalysisCount: discoveryAnalyses.length,
+        evaluationAnalysisCount: dataSplit.evaluationAnalyses.length,
+        projectionOnlyAnalysisCount: dataSplit.projectionOnlyAnalyses.length,
+      } : {}),
       approvedSynthesisCount: profileResult.synthesisProfiles.length,
-      distinctSourceCount: new Set(analyses.map((analysis) => analysis.sourceDigest)).size,
+      distinctSourceCount: independentSources.groupCount,
       rawNeuronCount,
       profileCount: profileResult.profiles.length,
       profileFeatureCount: profileResult.profiles.reduce((sum, profile) => sum + profile.vector.entries.length, 0),

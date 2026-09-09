@@ -1,7 +1,9 @@
 # Dependencies and generated output
 node_modules/
 dist/
+dist-training-service/
 coverage/
+server-data/
 
 # Local environment and logs
 .env

@@ -13,6 +13,7 @@ export type FunctionalRegionId =
   | 'event'
   | 'role'
   | 'operator'
+  | 'unknown'
   | 'goal'
   | 'language'
   | 'control'
@@ -53,6 +54,13 @@ export const FUNCTIONAL_REGIONS: readonly FunctionalRegionDefinition[] = Object.
     id: 'operator',
     label: 'Operatör',
     description: 'Olayın kapsamını, zamanını, olumsuzluğunu veya kesinliğini değiştirme hipotezi.',
+    verification: 'static-hypothesis',
+    dormantInStaticCorpus: false,
+  },
+  {
+    id: 'unknown',
+    label: 'Belirsiz',
+    description: 'Statik yapısal kanıtı tek bir işlev bölgesini güvenle seçmeye yetmeyen aile.',
     verification: 'static-hypothesis',
     dormantInStaticCorpus: false,
   },
@@ -120,6 +128,7 @@ export interface FamilyAnalysisInput {
   version: 2
   runId: string
   createdAt: string
+  independenceGroupId?: string
   sourceDigest: string
   identitySpaceId: string
   contextSpaceId: string
@@ -213,6 +222,8 @@ export interface FamilyProgress {
 export interface IndependentEvidenceRef {
   memberKey: string
   analysisRunId: string
+  /** Stable provenance lineage; legacy evidence may omit it. */
+  independenceGroupId?: string
   sourceId: string
   sourceDigest: string
   neuronId: string
@@ -334,9 +345,30 @@ export interface FamilyInputManifestEntry {
 export interface FamilyInputManifest {
   entries: FamilyInputManifestEntry[]
   corpusFingerprint: string
+  /**
+   * Optional split contract used when family discovery is isolated from its
+   * evaluation corpus. Older v1 archives omit this field and retain the
+   * original all-source cross-validation behavior.
+   */
+  dataSplit?: FamilyDataSplitManifest
+}
+
+export interface FamilyDataSplitManifest {
+  mode: 'declared-independent-groups'
+  /** Content fingerprint of inputs allowed to change learned structure. */
+  discoveryCorpusFingerprint: string
+  discoveryIndependenceGroupIds: string[]
+  evaluationIndependenceGroupIds: string[]
+  discoveryAnalysisRunIds: string[]
+  evaluationAnalysisRunIds: string[]
+  projectionOnlyAnalysisRunIds: string[]
+  utilityFallback: 'none' | 'discovery-source-holdout'
 }
 
 export interface HoldoutFoldMetric {
+  /** Stable physical-source identity; all chunks of one book are held out together. Older archives may omit it. */
+  heldOutSourceId?: string
+  /** Representative content digest retained for traceability and v1 UI compatibility. */
   heldOutSourceDigest: string
   caseCount: number
   fullLoss: number
@@ -346,7 +378,7 @@ export interface HoldoutFoldMetric {
 
 export interface FamilyUtilityReport {
   familyId: string
-  mode: 'source-holdout-diagnostic'
+  mode: 'source-holdout-diagnostic' | 'declared-evaluation-diagnostic'
   status: 'validated' | 'insufficient-evidence' | 'neutral-or-harmful'
   caseCount: number
   sourceFoldCount: number
@@ -439,6 +471,12 @@ export interface RouteDistribution {
 
 export interface FamilyRunStats {
   inputAnalysisCount: number
+  /** Present for split-aware runs; omitted by legacy archives. */
+  discoveryAnalysisCount?: number
+  /** Present for split-aware runs; omitted by legacy archives. */
+  evaluationAnalysisCount?: number
+  /** Profiles are still built for these analyses, but they cannot teach. */
+  projectionOnlyAnalysisCount?: number
   approvedSynthesisCount: number
   distinctSourceCount: number
   rawNeuronCount: number
@@ -480,6 +518,18 @@ export interface FamilyRun {
 
 export interface FamilyRunInput {
   analyses: FamilyAnalysisInput[]
+  /**
+   * Provenance lineages allowed to form prototypes and teach H⁰/G. When
+   * omitted together with evaluationIndependenceGroupIds, legacy all-source
+   * behavior is preserved. If only evaluation groups are declared, every
+   * non-evaluation analysis becomes discovery data.
+   */
+  discoveryIndependenceGroupIds?: string[]
+  /**
+   * Provenance lineages reserved for out-of-sample membership projection and
+   * utility measurement. They never form prototypes or transition evidence.
+   */
+  evaluationIndependenceGroupIds?: string[]
   synthesisDecisions?: FamilySynthesisDecisionInput[]
   previousRun?: FamilyRun | null
   activations?: NeuronActivation[]
@@ -490,4 +540,3 @@ export interface FamilyRunOptions {
   shouldCancel?: () => boolean
   yieldControl?: () => Promise<void>
 }
-

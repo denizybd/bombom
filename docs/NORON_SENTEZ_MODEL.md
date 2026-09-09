@@ -64,11 +64,14 @@ Hesap ana arayüz iş parçacığında değil ayrı bir Web Worker içinde yür�
 Güçlü bağlar deterministik, boyutu sınırlı tam-bağ uyumlu kümelere birleştirilir. `A-B` ve `B-C` eşikleri geçse bile `A-C` geçmiyorsa üçü aynı kümeye alınmaz; böylece tek-bağ zincirlemesi birbirine benzemeyen uçlardan sahte bir aday doğuramaz. Aynı metindeki üst düğüm ile onun içindeki çakışan alt düğümler ayrı gözlem sayılmaz. Bir adayın doğabilmesi için:
 
 ```text
-bağımsız destek >= minimumSupport
-farklı sourceDigest sayısı >= minimumSources
+bağımsız, çakışmayan destek >= minimumSupport
+farklı bağımsız kaynak/üretim soyu sayısı >= minimumSources
 ```
 
-Varsayılan olarak en az üç bağımsız parça ve iki farklı ham metin gerekir.
+Varsayılan olarak en az üç bağımsız parça ve iki bağımsız kaynak soyu gerekir.
+Aynı Ollama kampanya/model soyunun farklı metinleri tekrar kanıt sağlayabilir,
+ancak yeni bir bağımsız kaynak gibi sayılmaz. Aynı `sourceId` veya birebir aynı
+`sourceDigest` de önceki tekrar-kopya davranışıyla tek kaynakta birleştirilir.
 
 ## 6. Yeni nöronun doğumu
 

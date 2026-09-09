@@ -4,10 +4,20 @@ import type {
   RawTextNeuron,
   TextLabConfig,
 } from '../domain/types'
+import {
+  ADAPTIVE_TEXT_LAB_PROFILE_ID,
+  resolveTextLabRepresentationProfileId,
+} from '../domain/config'
 import { coprimeMultiplier, hashInteger } from './hash'
 import { clamp, cosineRegion, vectorNorm } from './matrix'
 import { projectIdentityToRelation } from './encode'
 import { digestVector } from './representation'
+import {
+  ADAPTIVE_CELLS_PER_PAGE,
+  ADAPTIVE_PAGE_COUNT,
+  ADAPTIVE_RELATION_LENGTH,
+  relationIndexFromPage,
+} from './relationPages'
 
 type TraceOperator = 'parent' | 'left' | 'right'
 
@@ -21,7 +31,9 @@ export function transformRelation(
   relation: ArrayLike<number>,
   operator: TraceOperator,
   seed: number,
+  pageAware = false,
 ): Float32Array {
+  if (pageAware) return transformAdaptiveRelationPages(relation, operator, seed)
   const output = new Float32Array(relation.length)
   if (!relation.length) return output
   const operatorSeed = seed ^ OPERATOR_SEEDS[operator]
@@ -34,6 +46,54 @@ export function transformRelation(
     output[target] = relation[index] * sign
   }
   return output
+}
+
+/**
+ * Adaptive-profile transform: permutes complete physical pages, then applies a
+ * separate signed permutation inside each page. No cell crosses a page without
+ * its complete source page, so 8×8 atoms remain meaningful to the later atlas.
+ */
+function transformAdaptiveRelationPages(
+  relation: ArrayLike<number>,
+  operator: TraceOperator,
+  seed: number,
+): Float32Array {
+  if (relation.length !== ADAPTIVE_RELATION_LENGTH) {
+    throw new RangeError(`Sayfa-duyarlı ilişki dönüşümü ${ADAPTIVE_RELATION_LENGTH} hücre gerektirir.`)
+  }
+  const output = new Float32Array(relation.length)
+  const operatorSeed = seed ^ OPERATOR_SEEDS[operator]
+  const pageMultiplier = coprimeMultiplier(ADAPTIVE_PAGE_COUNT, operatorSeed)
+  const pageOffset = hashInteger(
+    ADAPTIVE_PAGE_COUNT,
+    operatorSeed ^ 0x9e3779b9,
+  ) % ADAPTIVE_PAGE_COUNT
+
+  for (let sourcePage = 0; sourcePage < ADAPTIVE_PAGE_COUNT; sourcePage += 1) {
+    const targetPage = (
+      Math.imul(sourcePage, pageMultiplier) + pageOffset
+    ) % ADAPTIVE_PAGE_COUNT
+    const pageSeed = operatorSeed ^ hashInteger(sourcePage, 0x6a09e667)
+    const cellMultiplier = coprimeMultiplier(ADAPTIVE_CELLS_PER_PAGE, pageSeed)
+    const cellOffset = hashInteger(
+      ADAPTIVE_CELLS_PER_PAGE,
+      pageSeed ^ 0xbb67ae85,
+    ) % ADAPTIVE_CELLS_PER_PAGE
+
+    for (let sourceCell = 0; sourceCell < ADAPTIVE_CELLS_PER_PAGE; sourceCell += 1) {
+      const targetCell = (
+        Math.imul(sourceCell, cellMultiplier) + cellOffset
+      ) % ADAPTIVE_CELLS_PER_PAGE
+      const sign = (hashInteger(sourceCell, pageSeed ^ 0x3c6ef372) & 1) === 0 ? 1 : -1
+      output[relationIndexFromPage(targetPage, targetCell)] =
+        relation[relationIndexFromPage(sourcePage, sourceCell)] * sign
+    }
+  }
+  return output
+}
+
+function usesAdaptivePages(config: TextLabConfig): boolean {
+  return resolveTextLabRepresentationProfileId(config) === ADAPTIVE_TEXT_LAB_PROFILE_ID
 }
 
 function traceGain(compatibility: number, minimumTrace: number): number {
@@ -96,6 +156,7 @@ export function propagateContext(
         projectIdentityToRelation(parentIdentity, layout, config),
         'parent',
         config.hashSeed,
+        usesAdaptivePages(config),
       )
 
       const parentRelation = parent.relation
@@ -117,7 +178,12 @@ export function propagateContext(
         siblingGain = traceGain(siblingCompatibility, config.minimumTrace)
         const projectedSibling = projectIdentityToRelation(siblingIdentity, layout, config)
         const direction = child.branch === 'left' ? 'right' : 'left'
-        siblingSignature = transformRelation(projectedSibling, direction, config.hashSeed)
+        siblingSignature = transformRelation(
+          projectedSibling,
+          direction,
+          config.hashSeed,
+          usesAdaptivePages(config),
+        )
       }
 
       for (let index = 0; index < nextRelation.length; index += 1) {
@@ -173,6 +239,7 @@ export function explainContextStep(
     projectIdentityToRelation(parent.identity, layout, config),
     'parent',
     config.hashSeed,
+    usesAdaptivePages(config),
   )
   const parentTrace = Float32Array.from(
     parentSignature,
@@ -187,6 +254,7 @@ export function explainContextStep(
         projectIdentityToRelation(sibling.identity, layout, config),
         operator,
         config.hashSeed,
+        usesAdaptivePages(config),
       )
       const gain = config.siblingTraceWeight * node.trace.siblingGain
       for (let index = 0; index < signature.length; index += 1) {

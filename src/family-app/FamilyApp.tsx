@@ -2,7 +2,6 @@ import {
   Activity,
   AlertTriangle,
   Archive,
-  ArrowLeft,
   BarChart3,
   BrainCircuit,
   Check,
@@ -10,7 +9,6 @@ import {
   CircleStop,
   Database,
   Download,
-  FlaskConical,
   GitBranch,
   Info,
   Layers3,
@@ -38,6 +36,7 @@ import {
   useRef,
   useState,
 } from 'react'
+import { SuiteMenu } from '../components/SuiteMenu'
 import {
   DEFAULT_FAMILY_CONFIG,
 } from '../families'
@@ -492,9 +491,21 @@ function ProfilesView({
         <section className="fa-panel fa-panel--padded">
           <div className="fa-panel__heading"><div><span className="fa-eyebrow">İŞLEV HİPOTEZLERİ</span><h2>Üst bölge yakınlığı</h2></div><BrainCircuit size={16} /></div>
           <div className="fa-evidence-list">
-            {selected?.regionAffinities.map((affinity) => (
-              <div key={affinity.region} className="fa-evidence-row"><b>{regionDefinition(affinity.region).label} · {formatDecimal(affinity.score, 3)}</b><span>{affinity.explanation}</span><span className={`fa-chip ${affinity.verified ? 'fa-chip--good' : 'fa-chip--warn'}`}>{affinity.verified ? 'Çalışma zamanında doğrulandı' : 'Statik hipotez'}</span></div>
-            ))}
+            {selected?.regionAffinities.map((affinity) => {
+              const definition = regionDefinition(affinity.region)
+              const stateLabel = affinity.verified
+                ? 'Çalışma zamanında doğrulandı'
+                : definition.verification === 'runtime-required'
+                  ? 'Runtime deneyimi gerekli'
+                  : 'Statik hipotez'
+              return (
+                <div key={affinity.region} className="fa-evidence-row">
+                  <b>{definition.label} · {formatDecimal(affinity.score, 3)}</b>
+                  <span>{affinity.explanation}</span>
+                  <span className={`fa-chip ${affinity.verified ? 'fa-chip--good' : 'fa-chip--warn'}`}>{stateLabel}</span>
+                </div>
+              )
+            })}
           </div>
         </section>
         <section className="fa-panel fa-panel--padded">
@@ -824,8 +835,8 @@ function UtilityReportView({ report }: { report: FamilyUtilityReport }) {
   return <>
     <div className="fa-ablation-grid"><div><span>TAM KAYIP</span><strong>{formatDecimal(report.fullLoss, 4)}</strong><small>aile açık</small></div><div><span>SUSTURULMUŞ KAYIP</span><strong>{formatDecimal(report.ablatedLoss, 4)}</strong><small>aile kapalı</small></div><div><span>FAYDA ΔU</span><strong className={report.deltaUtility > 0 ? 'is-positive' : ''}>{formatDecimal(report.deltaUtility, 4)}</strong><small>{report.confidenceLow.toFixed(4)}…{report.confidenceHigh.toFixed(4)}</small></div></div>
     <div className={`fa-${report.status === 'validated' ? 'good-note' : report.status === 'neutral-or-harmful' ? 'warning' : 'setting-note'}`} style={{ marginTop: 12 }}><TestTube2 size={14} /><span>{report.explanation}</span></div>
-    <div className="fa-ablation-bars">{report.folds.slice(0, 20).map((fold) => <div className="fa-ablation-row" key={fold.heldOutSourceDigest}><span title={fold.heldOutSourceDigest}>{shortId(fold.heldOutSourceDigest)}</span><div className="fa-ablation-track" aria-label={`Tam kayıp ${fold.fullLoss.toFixed(4)}, susturulmuş kayıp ${fold.ablatedLoss.toFixed(4)}`}><i style={{ width: `${Math.max(1, fold.fullLoss / scale * 100)}%` }} /><em style={{ width: `${Math.max(1, fold.ablatedLoss / scale * 100)}%` }} /></div><b>{fold.deltaUtility.toFixed(4)}</b></div>)}</div>
-    <details className="fa-accessible-data"><summary>Kaynak katlarını erişilebilir tabloda göster</summary><div><table><thead><tr><th>Tutulan kaynak</th><th>Vaka</th><th>Tam kayıp</th><th>Susturulmuş</th><th>ΔU</th></tr></thead><tbody>{report.folds.map((fold) => <tr key={fold.heldOutSourceDigest}><th>{fold.heldOutSourceDigest}</th><td>{fold.caseCount}</td><td>{fold.fullLoss.toFixed(6)}</td><td>{fold.ablatedLoss.toFixed(6)}</td><td>{fold.deltaUtility.toFixed(6)}</td></tr>)}</tbody></table></div></details>
+    <div className="fa-ablation-bars">{report.folds.slice(0, 20).map((fold) => { const sourceKey = fold.heldOutSourceId ?? fold.heldOutSourceDigest; return <div className="fa-ablation-row" key={sourceKey}><span title={`${sourceKey} · ${fold.heldOutSourceDigest}`}>{shortId(sourceKey)}</span><div className="fa-ablation-track" aria-label={`Tam kayıp ${fold.fullLoss.toFixed(4)}, susturulmuş kayıp ${fold.ablatedLoss.toFixed(4)}`}><i style={{ width: `${Math.max(1, fold.fullLoss / scale * 100)}%` }} /><em style={{ width: `${Math.max(1, fold.ablatedLoss / scale * 100)}%` }} /></div><b>{fold.deltaUtility.toFixed(4)}</b></div> })}</div>
+    <details className="fa-accessible-data"><summary>Kaynak katlarını erişilebilir tabloda göster</summary><div><table><thead><tr><th>Tutulan kaynak</th><th>Vaka</th><th>Tam kayıp</th><th>Susturulmuş</th><th>ΔU</th></tr></thead><tbody>{report.folds.map((fold) => { const sourceKey = fold.heldOutSourceId ?? fold.heldOutSourceDigest; return <tr key={sourceKey}><th>{sourceKey}</th><td>{fold.caseCount}</td><td>{fold.fullLoss.toFixed(6)}</td><td>{fold.ablatedLoss.toFixed(6)}</td><td>{fold.deltaUtility.toFixed(6)}</td></tr> })}</tbody></table></div></details>
   </>
 }
 
@@ -1126,9 +1137,9 @@ export function FamilyApp() {
   return (
     <div className="fa-app">
       <header className="fa-topbar">
-        <div className="fa-brand"><span className="fa-brand__mark"><UsersRound size={22} /></span><div><strong>NÖRON AİLELERİ</strong><small>DAVRANIŞ, ÜYELİK VE KOALİSYON LABORATUVARI · v0.1</small></div></div>
+        <SuiteMenu currentApp="families" navigationLocked={runState !== 'idle'}><div className="fa-brand"><span className="fa-brand__mark"><UsersRound size={22} /></span><div><strong>NÖRON AİLELERİ</strong><small>DAVRANIŞ, ÜYELİK VE KOALİSYON LABORATUVARI · v0.1</small></div></div></SuiteMenu>
         <span className={`fa-status-pill ${status.tone}`}><i />{status.label}</span>
-        <div className="fa-topbar__actions"><a className="fa-link" href="/noron-sentezi/"><ArrowLeft size={13} /><span>Nöron Sentezi</span></a><a className="fa-link" href="/metin-laboratuvari/"><FlaskConical size={13} /><span>Metin Laboratuvarı</span></a>{run && <button className="fa-icon-button" aria-label="Koşuyu dışa aktar" title="Koşuyu dışa aktar" onClick={() => downloadRun(run)}><Download size={15} /></button>}</div>
+        <div className="fa-topbar__actions">{run && <button className="fa-icon-button" aria-label="Koşuyu dışa aktar" title="Koşuyu dışa aktar" onClick={() => downloadRun(run)}><Download size={15} /></button>}</div>
       </header>
 
       <nav className="fa-stage-rail" aria-label="Nöron aileleri aşamaları">

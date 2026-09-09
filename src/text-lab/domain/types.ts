@@ -11,7 +11,17 @@ export type PipelineStage =
   | 'connecting'
   | 'complete'
 
+/**
+ * A named physical/encoder contract. Historical projects did not carry this
+ * field; an absent value is deliberately resolved as the legacy profile.
+ */
+export type TextLabRepresentationProfileId =
+  | 'legacy-quarter-id-v2'
+  | 'adaptive-eighth-id-v1'
+
 export interface TextLabConfig {
+  /** Optional on the wire so pre-profile projects remain byte-compatible. */
+  representationProfile?: TextLabRepresentationProfileId
   matrixSide: number
   identityRatio: number
   minimumLeafGraphemes: number
@@ -96,6 +106,12 @@ export interface TextLabAnalysis {
   version: 2
   runId: string
   createdAt: string
+  /**
+   * Optional evidence-lineage identity supplied by the ingest/runtime layer.
+   * It never participates in I/R encoding; it only prevents correlated source
+   * outputs from being counted as independent witnesses downstream.
+   */
+  independenceGroupId?: string
   sourceDigest: string
   identitySpaceId: string
   contextSpaceId: string

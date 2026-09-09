@@ -22,6 +22,8 @@ import {
   stableDigest,
   weightedSparseMean,
 } from './sparse'
+import { createIndependentSourceIndex } from './independence'
+import type { IndependentSourceIndex } from './independence'
 
 export interface BehaviorEdge {
   leftMemberKey: string
@@ -41,8 +43,26 @@ export interface FamilyDiscoveryResult {
   stats: FamilyDiscoveryStats
 }
 
-function sourceDigest(profile: BehaviorProfile): string {
-  return profile.evidence[0]?.sourceDigest ?? ''
+const STATIC_CLASSIFIABLE_REGIONS = ['content', 'event', 'role', 'operator'] as const
+export const STATIC_REGION_MINIMUM_SCORE = 0.5
+export const STATIC_REGION_MINIMUM_MARGIN = 0.08
+
+type StructuralSeedBand = 'root' | 'shallow-parent' | 'middle-parent' | 'deep-parent'
+
+const STRUCTURAL_SEED_BANDS: readonly StructuralSeedBand[] = [
+  'root',
+  'shallow-parent',
+  'middle-parent',
+  'deep-parent',
+]
+const MAXIMUM_ADDITIONAL_MULTISCALE_SEEDS = 4_096
+
+function independentSourceId(
+  profile: BehaviorProfile,
+  sourceIndex: IndependentSourceIndex,
+): string {
+  const evidence = profile.evidence[0]
+  return evidence ? sourceIndex.groupKey(evidence) : ''
 }
 
 function edgeKey(left: string, right: string): string {
@@ -60,6 +80,7 @@ function compareEdge(left: BehaviorEdge, right: BehaviorEdge): number {
 function boundedBehaviorEdges(
   profiles: readonly BehaviorProfile[],
   config: FamilyConfig,
+  sourceIndex: IndependentSourceIndex,
   shouldCancel?: () => boolean,
 ): { edges: BehaviorEdge[]; comparisons: number } {
   const ordered = [...profiles].sort((left, right) => compareText(left.memberKey, right.memberKey))
@@ -87,11 +108,15 @@ function boundedBehaviorEdges(
       }
     }
     const candidates = [...shared.entries()]
+      .filter(([candidateKey]) => {
+        const candidate = profileByKey.get(candidateKey)
+        return candidate && independentSourceId(candidate, sourceIndex) !== independentSourceId(profile, sourceIndex)
+      })
       .sort((left, right) => right[1] - left[1] || compareText(left[0], right[0]))
       .slice(0, config.maximumCandidateNeighbors * 4)
     for (const [candidateKey] of candidates) {
       const candidate = profileByKey.get(candidateKey)
-      if (!candidate || sourceDigest(candidate) === sourceDigest(profile)) continue
+      if (!candidate) continue
       comparisons += 1
       const similarity = sparseCosine(profile.vector, candidate.vector)
       if (similarity < config.minimumFormationSimilarity) continue
@@ -115,7 +140,21 @@ function boundedBehaviorEdges(
   for (const memberEdges of retainedByMember.values()) {
     for (const edge of memberEdges) unique.set(edgeKey(edge.leftMemberKey, edge.rightMemberKey), edge)
   }
-  return { edges: [...unique.values()].sort(compareEdge), comparisons }
+  // The union of endpoint-local top-k lists is still O(nk), but a popular hub
+  // can exceed k in that union. This deterministic pass makes the advertised
+  // per-member graph bound real without materializing all n² pairs.
+  const degree = new Map<string, number>()
+  const edges: BehaviorEdge[] = []
+  for (const edge of [...unique.values()].sort(compareEdge)) {
+    if (
+      (degree.get(edge.leftMemberKey) ?? 0) >= config.maximumCandidateNeighbors ||
+      (degree.get(edge.rightMemberKey) ?? 0) >= config.maximumCandidateNeighbors
+    ) continue
+    edges.push(edge)
+    degree.set(edge.leftMemberKey, (degree.get(edge.leftMemberKey) ?? 0) + 1)
+    degree.set(edge.rightMemberKey, (degree.get(edge.rightMemberKey) ?? 0) + 1)
+  }
+  return { edges, comparisons }
 }
 
 class CompleteLinkClusters {
@@ -195,14 +234,115 @@ function averageSimilarity(profiles: readonly BehaviorProfile[]): number {
 }
 
 function chooseRegion(profiles: readonly BehaviorProfile[]): FunctionalRegionId {
-  const candidates: FunctionalRegionId[] = ['content', 'event', 'role', 'operator']
-  return candidates
+  if (!profiles.length) return 'unknown'
+  const ranked = STATIC_CLASSIFIABLE_REGIONS
     .map((region) => ({
       region,
       score: profiles.reduce((sum, profile) => sum + profileRegionScore(profile, region), 0) /
         Math.max(1, profiles.length),
     }))
-    .sort((left, right) => right.score - left.score || compareText(left.region, right.region))[0].region
+    .sort((left, right) => right.score - left.score || compareText(left.region, right.region))
+  const top = ranked[0]
+  const runnerUp = ranked[1]
+  if (
+    !top ||
+    top.score < STATIC_REGION_MINIMUM_SCORE ||
+    !runnerUp ||
+    top.score - runnerUp.score < STATIC_REGION_MINIMUM_MARGIN
+  ) return 'unknown'
+  return top.region
+}
+
+function structuralSeedBand(profile: BehaviorProfile): StructuralSeedBand {
+  if (profile.diagnostics.depthScale <= 0) return 'root'
+  if (profile.diagnostics.depthScale <= 0.25) return 'shallow-parent'
+  if (profile.diagnostics.depthScale <= 0.6) return 'middle-parent'
+  return 'deep-parent'
+}
+
+function interleaveSourceGroups(
+  groups: ReadonlyMap<string, readonly BehaviorProfile[]>,
+): BehaviorProfile[] {
+  const sourceGroups = [...groups.keys()].sort(compareText)
+  const cursors = new Map(sourceGroups.map((sourceGroup) => [sourceGroup, 0]))
+  const result: BehaviorProfile[] = []
+  let progressed = true
+  while (progressed) {
+    progressed = false
+    for (const sourceGroup of sourceGroups) {
+      const profiles = groups.get(sourceGroup) ?? []
+      const cursor = cursors.get(sourceGroup) ?? 0
+      const profile = profiles[cursor]
+      if (!profile) continue
+      result.push(profile)
+      cursors.set(sourceGroup, cursor + 1)
+      progressed = true
+    }
+  }
+  return result
+}
+
+/**
+ * Keeps every leaf seed for backwards coverage, then admits a bounded,
+ * source-balanced sample of roots and internal parents at several depths.
+ * This prevents the family learner from mistaking "is a short leaf" for a
+ * universal semantic role while retaining deterministic memory bounds.
+ */
+function multiScaleSeedProfiles(
+  rawProfiles: readonly BehaviorProfile[],
+  leafMemberKeys: ReadonlySet<string>,
+  config: FamilyConfig,
+  sourceIndex: IndependentSourceIndex,
+): BehaviorProfile[] {
+  const ordered = [...rawProfiles].sort((left, right) => compareText(left.memberKey, right.memberKey))
+  const leaves = ordered.filter((profile) => leafMemberKeys.has(profile.memberKey))
+  const parents = ordered.filter((profile) => !leafMemberKeys.has(profile.memberKey))
+  if (!parents.length) return leaves
+
+  const byBand = new Map<StructuralSeedBand, Map<string, BehaviorProfile[]>>()
+  for (const profile of parents) {
+    const band = structuralSeedBand(profile)
+    const sourceGroup = independentSourceId(profile, sourceIndex) || profile.memberKey
+    const bySource = byBand.get(band) ?? new Map<string, BehaviorProfile[]>()
+    const profiles = bySource.get(sourceGroup) ?? []
+    profiles.push(profile)
+    bySource.set(sourceGroup, profiles)
+    byBand.set(band, bySource)
+  }
+  for (const bySource of byBand.values()) {
+    for (const profiles of bySource.values()) {
+      profiles.sort((left, right) => compareText(left.memberKey, right.memberKey))
+    }
+  }
+
+  const minimumBudget = Math.max(config.minimumSupport, config.minimumSources) * STRUCTURAL_SEED_BANDS.length
+  const corpusBudget = Math.ceil(Math.sqrt(Math.max(1, rawProfiles.length)) * STRUCTURAL_SEED_BANDS.length)
+  const budget = Math.min(
+    parents.length,
+    MAXIMUM_ADDITIONAL_MULTISCALE_SEEDS,
+    Math.max(minimumBudget, corpusBudget),
+  )
+  const queues = new Map(STRUCTURAL_SEED_BANDS.map((band) => [
+    band,
+    interleaveSourceGroups(byBand.get(band) ?? new Map()),
+  ]))
+  const cursors = new Map(STRUCTURAL_SEED_BANDS.map((band) => [band, 0]))
+  const selected: BehaviorProfile[] = []
+  let progressed = true
+  while (selected.length < budget && progressed) {
+    progressed = false
+    for (const band of STRUCTURAL_SEED_BANDS) {
+      if (selected.length >= budget) break
+      const queue = queues.get(band) ?? []
+      const cursor = cursors.get(band) ?? 0
+      const profile = queue[cursor]
+      if (!profile) continue
+      selected.push(profile)
+      cursors.set(band, cursor + 1)
+      progressed = true
+    }
+  }
+  return [...leaves, ...selected].sort((left, right) => compareText(left.memberKey, right.memberKey))
 }
 
 function evidenceProfiles(
@@ -212,6 +352,24 @@ function evidenceProfiles(
   const keys = new Set(evidence.map((item) => item.memberKey))
   const selected = members.filter((profile) => keys.has(profile.memberKey))
   return selected.length ? selected : [...members]
+}
+
+/** Prevents one large book split into many chunks from dominating a family prototype. */
+function sourceBalancedProfileWeights(
+  profiles: readonly BehaviorProfile[],
+  sourceIndex: IndependentSourceIndex,
+): number[] {
+  const sourcesByProfile = profiles.map((profile) => [...new Set(
+    profile.evidence.map((item) => sourceIndex.groupKey(item)),
+  )])
+  const counts = new Map<string, number>()
+  for (const sources of sourcesByProfile) {
+    for (const source of sources) counts.set(source, (counts.get(source) ?? 0) + 1)
+  }
+  return sourcesByProfile.map((sources) => {
+    if (!sources.length) return 1
+    return sources.reduce((sum, source) => sum + 1 / Math.max(1, counts.get(source) ?? 1), 0) / sources.length
+  })
 }
 
 function priorMatch(
@@ -250,17 +408,19 @@ function buildFamily(
   memberKeys: readonly string[],
   profileByKey: ReadonlyMap<string, BehaviorProfile>,
   config: FamilyConfig,
+  sourceIndex: IndependentSourceIndex,
   previousRun: FamilyRun | null | undefined,
 ): LearnedFamily | null {
   const members = memberKeys
     .map((key) => profileByKey.get(key))
     .filter((profile): profile is BehaviorProfile => profile !== undefined)
   const evidence = selectIndependentEvidence(members.flatMap((profile) => profile.evidence))
-  const sourceCount = new Set(evidence.map((item) => item.sourceDigest)).size
+  const sourceCount = new Set(evidence.map((item) => sourceIndex.groupKey(item))).size
   if (evidence.length < config.minimumSupport || sourceCount < config.minimumSources) return null
   const coreProfiles = evidenceProfiles(members, evidence)
+  const sourceBalancedWeights = sourceBalancedProfileWeights(coreProfiles, sourceIndex)
   const prototype = weightedSparseMean(
-    coreProfiles.map((profile) => ({ vector: profile.vector, weight: 1 })),
+    coreProfiles.map((profile, index) => ({ vector: profile.vector, weight: sourceBalancedWeights[index] })),
     config.maximumProfileFeatures,
   )
   const prototypeDigest = sparseVectorDigest(prototype)
@@ -271,7 +431,13 @@ function buildFamily(
     region,
     prototypeDigest,
     ...memberKeys,
-    ...evidence.map((item) => `${item.sourceDigest}:${item.paragraphIndex}:${item.start}:${item.end}`),
+    ...evidence.map((item) => [
+      sourceIndex.groupKey(item),
+      item.sourceDigest,
+      item.paragraphIndex,
+      item.start,
+      item.end,
+    ].join(':')),
   ])
   const prior = priorMatch(prototype, members[0].behaviorSpaceId, region, memberKeys, previousRun)
   const strengthening = Boolean(
@@ -400,9 +566,10 @@ export function discoverFamilies(
   previousRun?: FamilyRun | null,
   shouldCancel?: () => boolean,
 ): FamilyDiscoveryResult {
-  const seedProfiles = rawProfiles.filter((profile) => leafMemberKeys.has(profile.memberKey))
+  const sourceIndex = createIndependentSourceIndex(rawProfiles.flatMap((profile) => profile.evidence))
+  const seedProfiles = multiScaleSeedProfiles(rawProfiles, leafMemberKeys, config, sourceIndex)
   const profileByKey = new Map(seedProfiles.map((profile) => [profile.memberKey, profile]))
-  const edgeResult = boundedBehaviorEdges(seedProfiles, config, shouldCancel)
+  const edgeResult = boundedBehaviorEdges(seedProfiles, config, sourceIndex, shouldCancel)
   const touched = new Set<string>()
   for (const edge of edgeResult.edges) {
     touched.add(edge.leftMemberKey)
@@ -413,15 +580,20 @@ export function discoverFamilies(
     if (shouldCancel?.()) throw new Error('FAMILY_CANCELLED')
     clusters.union(edge.leftMemberKey, edge.rightMemberKey)
   }
-  let families = clusters.groups()
-    .map((group) => buildFamily(group, profileByKey, config, previousRun))
+  const eligibleFamilies = clusters.groups()
+    .map((group) => buildFamily(group, profileByKey, config, sourceIndex, previousRun))
     .filter((family): family is LearnedFamily => family !== null)
     .sort((left, right) =>
       right.supportCount - left.supportCount ||
       right.cohesion - left.cohesion ||
       compareText(left.fingerprint, right.fingerprint),
     )
-    .slice(0, config.maximumFamilies)
+  // maximumFamilies remains an opt-in experiment/resource budget. The
+  // production default is Number.MAX_SAFE_INTEGER, so corpus evidence—not a
+  // historical 128 constant—sets the natural upper bound.
+  let families = eligibleFamilies.length > config.maximumFamilies
+    ? eligibleFamilies.slice(0, config.maximumFamilies)
+    : eligibleFamilies
   families = updateSeparationAndProposals(families, config)
   const memberships = assignSoftMemberships(allProfiles, families, config)
   // Soft M assignments are deliberately kept outside the evidence cluster.

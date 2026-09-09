@@ -5,6 +5,7 @@ import {
   assertIdentityUnchanged,
   buildBehaviorProfiles,
   createBehaviorSpaceId,
+  profileEvidenceConfidence,
   profilesFingerprint,
   selectIndependentEvidence,
   snapshotIdentityDigests,
@@ -236,6 +237,33 @@ describe('davranış profili', () => {
 
     expect(selected.map((item) => item.memberKey)).toEqual(['other-source', 'child', 'disjoint'])
     expect(new Set(selected.map((item) => item.sourceDigest)).size).toBe(2)
+  })
+
+  it('yeniden adlandırılmış aynı içerik üyelik güvenini şişirmez', () => {
+    const base = buildBehaviorProfiles(
+      [makeAnalysis()],
+      [],
+      'BS-test',
+      FAMILY_CONFIG,
+    ).profiles[0]
+    const copied = {
+      ...base,
+      evidence: [
+        evidence('copy-a', 'same-digest', 0, 4, { sourceId: 'book-a' }),
+        evidence('copy-b', 'same-digest', 0, 4, { sourceId: 'book-renamed' }),
+        evidence('copy-c', 'same-digest', 0, 4, { sourceId: 'book-third-name' }),
+      ],
+    }
+    const independent = {
+      ...base,
+      evidence: [
+        evidence('independent-a', 'digest-a', 0, 4, { sourceId: 'book-a' }),
+        evidence('independent-b', 'digest-b', 0, 4, { sourceId: 'book-b' }),
+        evidence('independent-c', 'digest-c', 0, 4, { sourceId: 'book-c' }),
+      ],
+    }
+
+    expect(profileEvidenceConfidence(copied)).toBeLessThan(profileEvidenceConfidence(independent))
   })
 
   it('profil çıkarırken I ve R byte alanlarına dokunmaz', () => {

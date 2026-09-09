@@ -89,6 +89,7 @@ function analysis(
   runId: string,
   nodes: RawTextNeuron[],
   hashSeed = 1,
+  independenceGroupId?: string,
 ): TextLabAnalysis {
   const rawTextLength = Math.max(1, ...nodes.map((node) => node.end))
   const rawText = sourceId.repeat(rawTextLength)
@@ -112,6 +113,7 @@ function analysis(
     version: 2,
     runId,
     createdAt: '2026-08-26T00:00:00.000Z',
+    independenceGroupId,
     sourceDigest: digestText(rawText),
     identitySpaceId,
     contextSpaceId,
@@ -201,6 +203,41 @@ describe('nöron sentez motoru', () => {
     expect(run.stats.comparedPairCount).toBe(0)
     expect(run.edges).toEqual([])
     expect(run.candidates).toEqual([])
+  })
+
+  it('aynı fiziksel kaynağın farklı analiz koşularını bağımsız doğum kanıtı saymaz', async () => {
+    const chunks = [
+      analysis('a', 'digest-chunk-1', 'run-chunk-1', [neuron('a1', 'a', [1, 0, 0], [1, 0])]),
+      analysis('a', 'digest-chunk-2', 'run-chunk-2', [neuron('a2', 'a', [0.99, 0.01, 0], [1, 0])]),
+    ]
+
+    const run = await runSynthesis(chunks, TEST_CONFIG)
+
+    expect(run.stats.inputAnalysisCount).toBe(2)
+    expect(run.stats.distinctSourceCount).toBe(1)
+    expect(run.stats.comparedPairCount).toBe(0)
+    expect(run.candidates).toEqual([])
+  })
+
+  it('aynı Ollama soyundaki farklı kaynak kimliklerini tek bağımsız grup sayar', async () => {
+    const inputs = [
+      analysis('a', 'digest-a', 'run-a', [neuron('a1', 'a', [1, 0, 0])], 1, 'ollama:qwen14b'),
+      analysis('b', 'digest-b', 'run-b', [neuron('b1', 'b', [0.99, 0.01, 0])], 1, 'ollama:qwen14b'),
+      analysis('c', 'digest-c', 'run-c', [neuron('c1', 'c', [0.98, 0.02, 0])], 1, 'human:book-c'),
+    ]
+
+    const run = await runSynthesis(inputs, TEST_CONFIG)
+
+    expect(run.stats.distinctSourceCount).toBe(2)
+    expect(run.stats.comparedPairCount).toBe(2)
+    expect(run.edges.some((edge) => new Set([edge.left.sourceId, edge.right.sourceId]).size === 2 &&
+      [edge.left.sourceId, edge.right.sourceId].includes('a') &&
+      [edge.left.sourceId, edge.right.sourceId].includes('b'))).toBe(false)
+    expect(run.candidates).toHaveLength(1)
+    expect(run.candidates[0]).toMatchObject({ supportCount: 3, sourceCount: 2 })
+
+    const strict = await runSynthesis(inputs, { ...TEST_CONFIG, minimumSources: 3 })
+    expect(strict.candidates).toEqual([])
   })
 
   it('eşiği geçen bağları akıtırken bellekteki komşuluğu sınırlar', async () => {

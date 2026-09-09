@@ -22,6 +22,7 @@ describe('project schema', () => {
 
     expect(restored.source.rawText).toBe('Korunacak ham metin.')
     expect(restored.config.matrixSide).toBe(64)
+    expect(Object.hasOwn(restored.config, 'representationProfile')).toBe(false)
     expect(restored.config.parentTraceWeight + restored.config.siblingTraceWeight).toBeCloseTo(0.3)
     expect(restored.analysis).toBeNull()
   })

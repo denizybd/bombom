@@ -26,7 +26,7 @@ interface FamilyGraphProps {
   label: string
 }
 
-const REGION_ORDER = ['content', 'event', 'role', 'operator', 'goal', 'language', 'control', 'emergent']
+const REGION_ORDER = ['content', 'event', 'role', 'operator', 'unknown', 'goal', 'language', 'control', 'emergent']
 
 function normalizeRegion(value: string): string {
   const key = value.toLocaleLowerCase('en-US')
@@ -34,6 +34,7 @@ function normalizeRegion(value: string): string {
   if (key.includes('olay') || key.includes('eylem') || key.includes('event')) return 'event'
   if (key.includes('rol') || key.includes('iliş') || key.includes('role')) return 'role'
   if (key.includes('operat') || key.includes('operator')) return 'operator'
+  if (key.includes('belirsiz') || key.includes('unknown')) return 'unknown'
   if (key.includes('amaç') || key.includes('değer') || key.includes('goal')) return 'goal'
   if (key.includes('dil') || key.includes('language')) return 'language'
   if (key.includes('kontrol') || key.includes('control')) return 'control'
@@ -46,6 +47,7 @@ function regionColor(region: string): string {
     case 'event': return '#c72d3e'
     case 'role': return '#087d70'
     case 'operator': return '#b9780b'
+    case 'unknown': return '#77736c'
     case 'goal': return '#7a478c'
     case 'language': return '#3b6b91'
     case 'control': return '#55514a'

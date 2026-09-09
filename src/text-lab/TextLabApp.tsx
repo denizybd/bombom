@@ -1,6 +1,5 @@
 import {
   AlertTriangle,
-  ArrowLeft,
   BarChart3,
   Braces,
   Check,
@@ -39,6 +38,7 @@ import {
   useRef,
   useState,
 } from 'react'
+import { SuiteMenu } from '../components/SuiteMenu'
 import { HeatmapCanvas, type HeatmapZone } from './components/HeatmapCanvas'
 import { SimilarityCanvas } from './components/SimilarityCanvas'
 import { SpanTree } from './components/SpanTree'
@@ -1203,18 +1203,16 @@ export default function TextLabApp() {
   return (
     <div className="tl-app-shell">
       <header className="tl-topbar">
-        <div className="tl-brand">
+        <SuiteMenu currentApp="text-lab" navigationLocked={navigationLocked}><div className="tl-brand">
           <span className="tl-brand-mark"><Network size={23} /></span>
           <div><strong>METİN LABORATUVARI</strong><span>HAM TEMSİL OLUŞTURUCU · v0.2</span></div>
-        </div>
+        </div></SuiteMenu>
         <div className="tl-topbar-center">
           {visibleRunState !== 'idle' ? <span className="tl-run-pill"><i /> {initializationState === 'loading' ? 'Arşiv açılıyor' : 'İşleniyor'}</span> : analysis ? <span className="tl-ready-pill"><Check size={13} /> Deney hazır</span> : <span className="tl-idle-pill"><FlaskConical size={13} /> Kaynak bekleniyor</span>}
           {initializationState === 'failed' && <span className="tl-stale-pill"><AlertTriangle size={13} /> Geçici çalışma</span>}
           {stale && <span className="tl-stale-pill"><AlertTriangle size={13} /> Sonuç eski kaynakta</span>}
         </div>
         <div className="tl-topbar-actions">
-          <a className={`tl-back-link ${navigationLocked ? 'is-disabled' : ''}`} aria-disabled={navigationLocked} tabIndex={navigationLocked ? -1 : undefined} onClick={(event) => navigationLocked && event.preventDefault()} href="/"><ArrowLeft size={14} /> Sinaps</a>
-          <a className={`tl-back-link ${navigationLocked ? 'is-disabled' : ''}`} aria-disabled={navigationLocked} tabIndex={navigationLocked ? -1 : undefined} onClick={(event) => navigationLocked && event.preventDefault()} href="/noron-sentezi/"><Sparkles size={14} /> Nöron Sentezi</a>
           <button disabled={!canUseWorkspace} onClick={exportProject} title="Projeyi dışa aktar" aria-label="Projeyi dışa aktar"><Download size={16} /></button>
           <button disabled={interactionLocked} onClick={() => importRef.current?.click()} title="Proje aç" aria-label="Proje aç"><Upload size={16} /></button>
           <input ref={importRef} type="file" accept="application/json" hidden onChange={importProject} />

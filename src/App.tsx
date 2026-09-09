@@ -8,7 +8,6 @@ import {
   CircleGauge,
   Download,
   FileJson,
-  FileText,
   Focus,
   Gauge,
   History,
@@ -41,6 +40,7 @@ import {
   useRef,
   useState,
 } from 'react'
+import { SuiteMenu } from './components/SuiteMenu'
 import { MatrixEditor } from './components/MatrixEditor'
 import { MatrixGrid } from './components/MatrixGrid'
 import {
@@ -864,13 +864,13 @@ function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand">
+        <SuiteMenu currentApp="sinaps"><div className="brand">
           <span className="brand-mark"><BrainCircuit size={24} /></span>
           <div>
             <strong>SİNAPS</strong>
             <span>GÖRSEL SANDBOX · v0.1</span>
           </div>
-        </div>
+        </div></SuiteMenu>
 
         <div className="transport" aria-label="Simülasyon kontrolleri">
           {simulation.status === 'running' ? (
@@ -896,12 +896,6 @@ function App() {
         </div>
 
         <div className="session-controls">
-          <a className="icon-button suite-link" href="/metin-laboratuvari/" title="Metin Laboratuvarını aç" aria-label="Metin Laboratuvarını aç">
-            <FileText size={16} />
-          </a>
-          <a className="icon-button suite-link" href="/noron-sentezi/" title="Nöron Sentez Laboratuvarını aç" aria-label="Nöron Sentez Laboratuvarını aç">
-            <Sparkles size={17} />
-          </a>
           <label className="number-control">
             <span>SEED</span>
             <input

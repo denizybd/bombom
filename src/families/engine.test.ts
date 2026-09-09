@@ -16,8 +16,14 @@ const textConfig = {
   minimumLeafGraphemes: 1,
 }
 
-async function input(id: string, rawText: string): Promise<FamilyAnalysisInput> {
-  return await analyzeText({ id, title: id, rawText }, textConfig)
+async function input(
+  id: string,
+  rawText: string,
+  independenceGroupId?: string,
+): Promise<FamilyAnalysisInput> {
+  const analysis = await analyzeText({ id, title: id, rawText }, textConfig)
+  analysis.independenceGroupId = independenceGroupId
+  return analysis
 }
 
 describe('nöron aileleri uçtan uca motoru', () => {
@@ -75,6 +81,165 @@ describe('nöron aileleri uçtan uca motoru', () => {
     expect(replay.families.some((family) => (
       family.lifecycle === 'strengthening' || family.lifecycle === 'stable'
     ))).toBe(false)
+  })
+
+  it('aynı metnin yeniden adlandırılmış kopyasını bağımsız fiziksel kaynak istatistiğine katmaz', async () => {
+    const analyses = await Promise.all([
+      input('original-book', 'Ali aynı metni okudu.'),
+      input('renamed-copy', 'Ali aynı metni okudu.'),
+      input('other-book', 'Ayşe başka metni okudu.'),
+    ])
+    const run = await runFamilyLearning({ analyses }, {
+      minimumFormationSimilarity: 0.1,
+      minimumMembershipScore: 0,
+      minimumCoreMembership: 0,
+      minimumSupport: 3,
+      minimumSources: 3,
+    })
+
+    expect(run.stats.distinctSourceCount).toBe(2)
+    expect(run.families).toEqual([])
+    expect(run.warnings.some((warning) => warning.includes('yeniden adlandırılmış içerik kopyası'))).toBe(true)
+  })
+
+  it('aynı Ollama üretim soyunun farklı metinlerini aile desteğinde tek kaynak sayar', async () => {
+    const analyses = await Promise.all([
+      input('lesson-a', 'Ali kırmızı kutuyu açtı.', 'ollama-lineage:qwen14b'),
+      input('lesson-b', 'Ayşe mavi kutuyu açtı!', 'ollama-lineage:qwen14b'),
+      input('human-book', 'Mert yeşil kutuyu açtı?', 'human:book'),
+    ])
+    const run = await runFamilyLearning({ analyses }, {
+      minimumFormationSimilarity: 0.1,
+      minimumMembershipScore: 0,
+      minimumCoreMembership: 0,
+      minimumSupport: 3,
+      minimumSources: 3,
+    })
+
+    expect(run.stats.distinctSourceCount).toBe(2)
+    expect(run.profiles.filter((profile) => profile.kind === 'raw').every((profile) =>
+      profile.evidence[0]?.independenceGroupId === analyses.find((analysis) =>
+        analysis.runId === profile.evidence[0]?.analysisRunId)?.independenceGroupId)).toBe(true)
+    expect(run.families).toEqual([])
+  })
+
+  it('değerlendirme-only analiz değişse bile keşif prototiplerini ve eğitim H⁰/G geçişlerini değiştirmez', async () => {
+    const discoveryAnalyses = await Promise.all([
+      input('train-a', 'Ali kırmızı kutuyu açtı.', 'train:a'),
+      input('train-b', 'Ayşe mavi kutuyu açtı!', 'train:b'),
+      input('train-c', 'Mert yeşil kutuyu açtı?', 'train:c'),
+    ])
+    const evaluationBefore = await input(
+      'evaluation-source',
+      'Deniz sarı kutuyu dikkatlice açtı.',
+      'evaluation:held-out',
+    )
+    const evaluationAfter = await input(
+      'evaluation-source',
+      'Uzak galaksideki sessiz gözlemci karmaşık bir bilmeceden söz etti.',
+      'evaluation:held-out',
+    )
+    const config = createFamilyConfig({
+      minimumFormationSimilarity: 0.1,
+      minimumMembershipScore: 0,
+      minimumCoreMembership: 0,
+      minimumSupport: 2,
+      minimumSources: 2,
+      maximumFamilies: 24,
+      utilityMinimumCases: 2,
+      utilityAlternativeCount: 2,
+    })
+    const split = {
+      discoveryIndependenceGroupIds: ['train:a', 'train:b', 'train:c'],
+      evaluationIndependenceGroupIds: ['evaluation:held-out'],
+    }
+    const before = await runFamilyLearning({
+      analyses: [...discoveryAnalyses, evaluationBefore],
+      ...split,
+    }, config)
+    const after = await runFamilyLearning({
+      analyses: [...discoveryAnalyses, evaluationAfter],
+      ...split,
+    }, config)
+    const afterWithPrevious = await runFamilyLearning({
+      analyses: [...discoveryAnalyses, evaluationAfter],
+      previousRun: before,
+      ...split,
+    }, config)
+
+    const learnedStructure = (run: typeof before) => run.families.map((family) => ({
+      id: family.id,
+      fingerprint: family.fingerprint,
+      prototypeDigest: family.prototypeDigest,
+      prototype: family.prototype,
+      memberKeys: family.memberKeys,
+      coreMemberKeys: family.coreMemberKeys,
+      independentEvidence: family.independentEvidence,
+      supportCount: family.supportCount,
+      sourceCount: family.sourceCount,
+      cohesion: family.cohesion,
+      separation: family.separation,
+      region: family.region,
+    }))
+    expect(before.families.length).toBeGreaterThan(0)
+    expect(learnedStructure(after)).toEqual(learnedStructure(before))
+    expect(after.neuronTransitions).toEqual(before.neuronTransitions)
+    expect(after.familyTransitions).toEqual(before.familyTransitions)
+    expect(after.behaviorSpaceId).toBe(before.behaviorSpaceId)
+    expect(after.inputManifest.corpusFingerprint).not.toBe(before.inputManifest.corpusFingerprint)
+    expect(after.inputManifest.dataSplit?.discoveryCorpusFingerprint)
+      .toBe(before.inputManifest.dataSplit?.discoveryCorpusFingerprint)
+    expect(afterWithPrevious.families.some((family) => (
+      family.lifecycle === 'strengthening' || family.lifecycle === 'stable'
+    ))).toBe(false)
+    expect(before.inputManifest.dataSplit).toMatchObject({
+      mode: 'declared-independent-groups',
+      discoveryAnalysisRunIds: discoveryAnalyses.map((analysis) => analysis.runId).sort(),
+      evaluationAnalysisRunIds: [evaluationBefore.runId],
+      utilityFallback: 'none',
+    })
+    expect(before.utilityReports.every((report) => report.mode === 'declared-evaluation-diagnostic')).toBe(true)
+  })
+
+  it('değerlendirme verisi yoksa açık uyarıyla yalnız keşif içi holdout tanısına döner', async () => {
+    const analyses = await Promise.all([
+      input('train-a', 'Ali kesti.', 'train:a'),
+      input('train-b', 'Ayşe kesti.', 'train:b'),
+      input('train-c', 'Mert kesti.', 'train:c'),
+    ])
+    const run = await runFamilyLearning({
+      analyses,
+      discoveryIndependenceGroupIds: ['train:a', 'train:b', 'train:c'],
+      evaluationIndependenceGroupIds: ['evaluation:missing'],
+    }, {
+      minimumFormationSimilarity: 0.1,
+      minimumMembershipScore: 0,
+      minimumCoreMembership: 0,
+      minimumSupport: 2,
+      minimumSources: 2,
+    })
+
+    expect(run.inputManifest.dataSplit?.utilityFallback).toBe('discovery-source-holdout')
+    expect(run.utilityReports.every((report) => report.mode === 'source-holdout-diagnostic')).toBe(true)
+    expect(run.utilityReports.every((report) => report.status === 'insufficient-evidence')).toBe(true)
+    expect(run.warnings.some((warning) => warning.includes('dış holdout kanıtı sayılmamalıdır'))).toBe(true)
+  })
+
+  it('kopya içerikle fiziksel olarak kesişen keşif/değerlendirme beyanını reddeder', async () => {
+    const analyses = await Promise.all([
+      input('train-copy', 'Aynı fiziksel içerik.', 'declared:train'),
+      input('evaluation-copy', 'Aynı fiziksel içerik.', 'declared:evaluation'),
+      input('train-other', 'Başka eğitim içeriği.', 'declared:other'),
+    ])
+
+    await expect(runFamilyLearning({
+      analyses,
+      discoveryIndependenceGroupIds: ['declared:train', 'declared:other'],
+      evaluationIndependenceGroupIds: ['declared:evaluation'],
+    })).rejects.toMatchObject({
+      name: 'FamilyValidationError',
+      code: 'INVALID_DATA_SPLIT',
+    } satisfies Partial<FamilyValidationError>)
   })
 
   it('iptali ortak hata tipine çevirir', async () => {

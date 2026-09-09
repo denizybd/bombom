@@ -2,6 +2,7 @@ import {
   createMatrixLayout,
   MAX_ANALYSIS_NODES,
   normalizeTextLabConfig,
+  resolveTextLabRepresentationProfileId,
   validateConfig,
 } from '../domain/config'
 import type { PersistedProject, TextLabAnalysis, TextLabConfig, TextSource } from '../domain/types'
@@ -278,6 +279,8 @@ export function analysisMatchesProject(
     analysis.source.id === source.id &&
     analysis.source.title === source.title &&
     analysis.source.rawText === source.rawText &&
+    resolveTextLabRepresentationProfileId(analysis.config) ===
+      resolveTextLabRepresentationProfileId(config) &&
     CONFIG_KEYS.every((key) => analysis.config[key] === config[key])
   )
 }

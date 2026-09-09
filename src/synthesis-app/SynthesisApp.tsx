@@ -18,7 +18,6 @@ import {
   Search,
   ShieldCheck,
   SlidersHorizontal,
-  UsersRound,
   X,
 } from 'lucide-react'
 import {
@@ -42,6 +41,8 @@ import type { SynthesisWorkerRequest, SynthesisWorkerResponse } from '../synthes
 import type { PersistedProject, TextLabAnalysis } from '../text-lab/engine'
 import { loadAllProjects } from '../text-lab/persistence/indexedDb'
 import { validateProject } from '../text-lab/persistence/projectSchema'
+import { SuiteMenu } from '../components/SuiteMenu'
+import { createIndependentSourceIndex } from '../families/independence'
 import { SynthesisHeatmap } from './SynthesisHeatmap'
 import {
   loadSynthesisArchive,
@@ -126,11 +127,21 @@ function eligibleNodes(analysis: TextLabAnalysis, config: SynthesisConfig): numb
 }
 
 function crossSourcePairs(analyses: readonly TextLabAnalysis[], config: SynthesisConfig): number {
+  const sourceIndex = createIndependentSourceIndex(analyses.map((analysis) => ({
+    independenceGroupId: analysis.independenceGroupId,
+    sourceId: analysis.source.id,
+    sourceDigest: analysis.sourceDigest,
+  })))
   const counts = new Map<string, number>()
   for (const analysis of analyses) {
+    const sourceGroup = sourceIndex.groupKey({
+      independenceGroupId: analysis.independenceGroupId,
+      sourceId: analysis.source.id,
+      sourceDigest: analysis.sourceDigest,
+    })
     counts.set(
-      analysis.sourceDigest,
-      (counts.get(analysis.sourceDigest) ?? 0) + eligibleNodes(analysis, config),
+      sourceGroup,
+      (counts.get(sourceGroup) ?? 0) + eligibleNodes(analysis, config),
     )
   }
   let prior = 0
@@ -142,11 +153,20 @@ function crossSourcePairs(analyses: readonly TextLabAnalysis[], config: Synthesi
   return total
 }
 
+function independentSourceCount(analyses: readonly TextLabAnalysis[]): number {
+  return createIndependentSourceIndex(analyses.map((analysis) => ({
+    independenceGroupId: analysis.independenceGroupId,
+    sourceId: analysis.source.id,
+    sourceDigest: analysis.sourceDigest,
+  }))).groupCount
+}
+
 function createWorkerAnalysisInput(analysis: TextLabAnalysis): SynthesisAnalysisInput {
   return {
     format: analysis.format,
     version: analysis.version,
     runId: analysis.runId,
+    independenceGroupId: analysis.independenceGroupId,
     sourceDigest: analysis.sourceDigest,
     identitySpaceId: analysis.identitySpaceId,
     contextSpaceId: analysis.contextSpaceId,
@@ -265,7 +285,7 @@ function CorpusView({
   }, [analyses])
   const compatible = analyses.filter((analysis) => analysis.representationSpaceId === activeSpaceId)
   const selected = compatible.filter((analysis) => selectedRunIds.has(analysis.runId))
-  const selectedSources = new Set(selected.map((analysis) => analysis.sourceDigest)).size
+  const selectedSources = independentSourceCount(selected)
   const selectedNeurons = selected.reduce((sum, analysis) => sum + eligibleNodes(analysis, config), 0)
   const comparisons = crossSourcePairs(selected, config)
   const largeRun = comparisons > 5_000_000
@@ -903,9 +923,9 @@ export function SynthesisApp() {
   return (
     <div className="ns-app">
       <header className="ns-topbar">
-        <div className="ns-brand"><span className="ns-brand__mark"><Network size={21} /></span><div><strong>NÖRON SENTEZİ</strong><small>YÜZEY KALIBI DOĞUM LABORATUVARI · v0.1</small></div></div>
+        <SuiteMenu currentApp="synthesis" navigationLocked={runState !== 'idle'}><div className="ns-brand"><span className="ns-brand__mark"><Network size={21} /></span><div><strong>NÖRON SENTEZİ</strong><small>YÜZEY KALIBI DOĞUM LABORATUVARI · v0.1</small></div></div></SuiteMenu>
         <span className={`ns-status-pill ${runState !== 'idle' ? 'ns-status-pill--running' : pendingAnalysisCount === 0 && analysisCount >= 2 ? 'ns-status-pill--ready' : ''}`}><i />{statusLabel}</span>
-        <div className="ns-topbar__actions"><a href="/metin-laboratuvari/" className="ns-back-link"><ArrowLeft size={13} /><span>Metin Laboratuvarı</span></a><a href="/noron-aileleri/" className="ns-back-link"><UsersRound size={13} /><span>Nöron Aileleri</span></a></div>
+        <div className="ns-topbar__actions" />
       </header>
 
       <nav className="ns-stage-rail" aria-label="Nöron sentezi aşamaları">

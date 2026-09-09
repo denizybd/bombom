@@ -8,8 +8,11 @@ import type {
 } from './types'
 import { rawMemberKey } from './profile'
 import { FAMILY_EPSILON, clamp, compareText } from './sparse'
+import { createIndependentSourceIndex } from './independence'
+import type { IndependentSourceIndex } from './independence'
 
 interface PredictionCase {
+  sourceId: string
   sourceDigest: string
   currentMemberKey: string
   targetMemberKey: string
@@ -25,6 +28,14 @@ interface FamilyProbability {
 interface MembershipWeight {
   familyId: string
   weight: number
+}
+
+function sourceIdentity(analysis: FamilyAnalysisInput) {
+  return {
+    independenceGroupId: analysis.independenceGroupId,
+    sourceId: analysis.source.id,
+    sourceDigest: analysis.sourceDigest,
+  }
 }
 
 function membershipIndex(
@@ -72,13 +83,15 @@ function leafPairs(analysis: FamilyAnalysisInput): Array<[string, string]> {
 function trainingFamilyProbabilities(
   analyses: readonly FamilyAnalysisInput[],
   memberships: ReadonlyMap<string, MembershipWeight[]>,
-  heldOutSourceDigest: string,
+  heldOutSourceGroup: string | null,
+  sourceIndex: IndependentSourceIndex,
   ablatedFamilyId?: string,
 ): FamilyProbability[] {
-  const combined = new Map<string, { fromFamilyId: string; toFamilyId: string; value: number }>()
+  const bySource = new Map<string, Map<string, { fromFamilyId: string; toFamilyId: string; value: number }>>()
   for (const analysis of analyses) {
-    if (analysis.sourceDigest === heldOutSourceDigest) continue
-    const sourceEvidence = new Map<string, { fromFamilyId: string; toFamilyId: string; value: number }>()
+    const sourceGroup = sourceIndex.groupKey(sourceIdentity(analysis))
+    if (heldOutSourceGroup !== null && sourceGroup === heldOutSourceGroup) continue
+    const sourceEvidence = bySource.get(sourceGroup) ?? new Map()
     for (const [fromMemberKey, toMemberKey] of leafPairs(analysis)) {
       const fromMemberships = memberships.get(fromMemberKey) ?? []
       const toMemberships = memberships.get(toMemberKey) ?? []
@@ -96,6 +109,13 @@ function trainingFamilyProbabilities(
         }
       }
     }
+    bySource.set(sourceGroup, sourceEvidence)
+  }
+
+  const combined = new Map<string, { fromFamilyId: string; toFamilyId: string; value: number }>()
+  for (const sourceEvidence of bySource.values()) {
+    // Every physical source contributes one normalized vote, regardless of
+    // how many runtime chunks were needed to process the book.
     const sourceTotal = [...sourceEvidence.values()].reduce((sum, entry) => sum + entry.value, 0)
     if (sourceTotal <= FAMILY_EPSILON) continue
     for (const [key, entry] of sourceEvidence) {
@@ -158,6 +178,7 @@ function buildCases(
       }
       if (alternatives.length < 2) continue
       cases.push({
+        sourceId: analysis.source.id,
         sourceDigest: analysis.sourceDigest,
         currentMemberKey,
         targetMemberKey,
@@ -223,7 +244,8 @@ function confidenceInterval(values: readonly number[]): { low: number; high: num
 }
 
 /**
- * Measures predictive utility on whole held-out source digests. Families were
+ * Measures predictive utility on whole held-out physical sources. Every
+ * analysis chunk with the same source id is held out together. Families were
  * discovered before this diagnostic, so the result is deliberately not called
  * causal or semantic proof.
  */
@@ -235,39 +257,58 @@ export function measureFamilyAblationUtilities(
   shouldCancel?: () => boolean,
   onFamily?: (completed: number, total: number) => void,
 ): FamilyUtilityReport[] {
-  const sourceDigests = [...new Set(analyses.map((analysis) => analysis.sourceDigest))].sort(compareText)
+  const sourceIndex = createIndependentSourceIndex(analyses.map(sourceIdentity))
+  const sourceGroups = [...new Set(analyses.map((analysis) =>
+    sourceIndex.groupKey(sourceIdentity(analysis))))].sort(compareText)
+  const representativeDigest = new Map<string, string>()
+  const representativeSourceId = new Map<string, string>()
+  for (const analysis of [...analyses].sort((left, right) => compareText(left.sourceDigest, right.sourceDigest))) {
+    const group = sourceIndex.groupKey(sourceIdentity(analysis))
+    if (!representativeDigest.has(group)) {
+      representativeDigest.set(group, analysis.sourceDigest)
+      representativeSourceId.set(group, sourceIndex.representativeSourceId(sourceIdentity(analysis)))
+    }
+  }
+  sourceGroups.sort((left, right) =>
+    compareText(representativeSourceId.get(left) ?? left, representativeSourceId.get(right) ?? right) ||
+    compareText(left, right),
+  )
   const fullMemberships = membershipIndex(membershipsInput)
   const membershipKeys = new Set(fullMemberships.keys())
   const casesBySource = new Map<string, PredictionCase[]>()
   for (const analysis of analyses) {
     const cases = buildCases(analysis, membershipKeys, config.utilityAlternativeCount)
-    const group = casesBySource.get(analysis.sourceDigest) ?? []
-    group.push(...cases)
-    casesBySource.set(analysis.sourceDigest, group)
+    const sourceGroup = sourceIndex.groupKey(sourceIdentity(analysis))
+    const groupCases = casesBySource.get(sourceGroup) ?? []
+    groupCases.push(...cases)
+    casesBySource.set(sourceGroup, groupCases)
   }
   const reports: FamilyUtilityReport[] = []
   families.forEach((family, familyIndex) => {
     if (shouldCancel?.()) throw new Error('FAMILY_CANCELLED')
     const ablatedMemberships = membershipIndex(membershipsInput, family.id)
     const folds: HoldoutFoldMetric[] = []
-    for (const heldOutSourceDigest of sourceDigests) {
-      const cases = casesBySource.get(heldOutSourceDigest) ?? []
-      if (!cases.length || sourceDigests.length - 1 < config.minimumSources) continue
+    for (const heldOutSourceGroup of sourceGroups) {
+      const cases = casesBySource.get(heldOutSourceGroup) ?? []
+      if (!cases.length || sourceGroups.length - 1 < config.minimumSources) continue
       const fullTransitions = trainingFamilyProbabilities(
         analyses,
         fullMemberships,
-        heldOutSourceDigest,
+        heldOutSourceGroup,
+        sourceIndex,
       )
       const ablatedTransitions = trainingFamilyProbabilities(
         analyses,
         ablatedMemberships,
-        heldOutSourceDigest,
+        heldOutSourceGroup,
+        sourceIndex,
         family.id,
       )
       const fullLoss = predictionLoss(cases, fullMemberships, fullTransitions, config.utilityEpsilon)
       const ablatedLoss = predictionLoss(cases, ablatedMemberships, ablatedTransitions, config.utilityEpsilon)
       folds.push({
-        heldOutSourceDigest,
+        heldOutSourceId: representativeSourceId.get(heldOutSourceGroup) ?? heldOutSourceGroup,
+        heldOutSourceDigest: representativeDigest.get(heldOutSourceGroup) ?? heldOutSourceGroup,
         caseCount: cases.length,
         fullLoss,
         ablatedLoss,
@@ -305,6 +346,119 @@ export function measureFamilyAblationUtilities(
         : validated
           ? 'Aile susturulduğunda aynı aday evrenindeki kaynak-holdout tahmin kaybı güvenilir biçimde arttı.'
           : 'Aile susturma kaybı pozitif ve kararlı değil; bu aile henüz işlevsel olarak doğrulanmadı.',
+    })
+    onFamily?.(familyIndex + 1, families.length)
+  })
+  return reports.sort((left, right) => compareText(left.familyId, right.familyId))
+}
+
+/**
+ * Measures a discovery-trained family's utility on a separately declared
+ * evaluation corpus. Family probabilities are fitted only from discovery
+ * analyses; evaluation analyses contribute cases and out-of-sample soft
+ * memberships, never prototypes or transition evidence.
+ */
+export function measureFamilyAblationUtilitiesOnEvaluation(
+  discoveryAnalyses: readonly FamilyAnalysisInput[],
+  evaluationAnalyses: readonly FamilyAnalysisInput[],
+  families: readonly LearnedFamily[],
+  membershipsInput: readonly FamilyMembership[],
+  config: FamilyConfig,
+  shouldCancel?: () => boolean,
+  onFamily?: (completed: number, total: number) => void,
+): FamilyUtilityReport[] {
+  const discoverySourceIndex = createIndependentSourceIndex(discoveryAnalyses.map(sourceIdentity))
+  const evaluationSourceIndex = createIndependentSourceIndex(evaluationAnalyses.map(sourceIdentity))
+  const evaluationSourceGroups = [...new Set(evaluationAnalyses.map((analysis) =>
+    evaluationSourceIndex.groupKey(sourceIdentity(analysis))))]
+  const representativeDigest = new Map<string, string>()
+  const representativeSourceId = new Map<string, string>()
+  for (const analysis of [...evaluationAnalyses].sort((left, right) =>
+    compareText(left.sourceDigest, right.sourceDigest) || compareText(left.runId, right.runId))) {
+    const group = evaluationSourceIndex.groupKey(sourceIdentity(analysis))
+    if (!representativeDigest.has(group)) {
+      representativeDigest.set(group, analysis.sourceDigest)
+      representativeSourceId.set(group, evaluationSourceIndex.representativeSourceId(sourceIdentity(analysis)))
+    }
+  }
+  evaluationSourceGroups.sort((left, right) =>
+    compareText(representativeSourceId.get(left) ?? left, representativeSourceId.get(right) ?? right) ||
+    compareText(left, right),
+  )
+
+  const fullMemberships = membershipIndex(membershipsInput)
+  const membershipKeys = new Set(fullMemberships.keys())
+  const casesBySource = new Map<string, PredictionCase[]>()
+  for (const analysis of evaluationAnalyses) {
+    const sourceGroup = evaluationSourceIndex.groupKey(sourceIdentity(analysis))
+    const cases = casesBySource.get(sourceGroup) ?? []
+    cases.push(...buildCases(analysis, membershipKeys, config.utilityAlternativeCount))
+    casesBySource.set(sourceGroup, cases)
+  }
+
+  const reports: FamilyUtilityReport[] = []
+  families.forEach((family, familyIndex) => {
+    if (shouldCancel?.()) throw new Error('FAMILY_CANCELLED')
+    const ablatedMemberships = membershipIndex(membershipsInput, family.id)
+    const fullTransitions = trainingFamilyProbabilities(
+      discoveryAnalyses,
+      fullMemberships,
+      null,
+      discoverySourceIndex,
+    )
+    const ablatedTransitions = trainingFamilyProbabilities(
+      discoveryAnalyses,
+      ablatedMemberships,
+      null,
+      discoverySourceIndex,
+      family.id,
+    )
+    const folds: HoldoutFoldMetric[] = []
+    for (const sourceGroup of evaluationSourceGroups) {
+      const cases = casesBySource.get(sourceGroup) ?? []
+      if (!cases.length) continue
+      const fullLoss = predictionLoss(cases, fullMemberships, fullTransitions, config.utilityEpsilon)
+      const ablatedLoss = predictionLoss(cases, ablatedMemberships, ablatedTransitions, config.utilityEpsilon)
+      folds.push({
+        heldOutSourceId: representativeSourceId.get(sourceGroup) ?? sourceGroup,
+        heldOutSourceDigest: representativeDigest.get(sourceGroup) ?? sourceGroup,
+        caseCount: cases.length,
+        fullLoss,
+        ablatedLoss,
+        deltaUtility: ablatedLoss - fullLoss,
+      })
+    }
+    const caseCount = folds.reduce((sum, fold) => sum + fold.caseCount, 0)
+    const weighted = (selector: (fold: HoldoutFoldMetric) => number) => caseCount
+      ? folds.reduce((sum, fold) => sum + selector(fold) * fold.caseCount, 0) / caseCount
+      : 0
+    const fullLoss = weighted((fold) => fold.fullLoss)
+    const ablatedLoss = weighted((fold) => fold.ablatedLoss)
+    const deltaUtility = ablatedLoss - fullLoss
+    const interval = confidenceInterval(folds.map((fold) => fold.deltaUtility))
+    const sufficient = caseCount >= config.utilityMinimumCases && folds.length >= 2
+    const validated = sufficient && deltaUtility > config.lifecycleUtilityThreshold && interval.low > 0
+    reports.push({
+      familyId: family.id,
+      mode: 'declared-evaluation-diagnostic',
+      status: !sufficient
+        ? 'insufficient-evidence'
+        : validated
+          ? 'validated'
+          : 'neutral-or-harmful',
+      caseCount,
+      sourceFoldCount: folds.length,
+      fullLoss,
+      ablatedLoss,
+      deltaUtility,
+      confidenceLow: interval.low,
+      confidenceHigh: interval.high,
+      folds,
+      explanation: !sufficient
+        ? 'Ayrı değerlendirme kaynakları ve gizli komşuluk vakaları kararlı bir fayda yargısı için yetersiz.'
+        : validated
+          ? 'Keşif verisinden öğrenilen aile susturulduğunda ayrı değerlendirme korpusundaki tahmin kaybı güvenilir biçimde arttı.'
+          : 'Ayrı değerlendirme korpusunda aile susturma kaybı pozitif ve kararlı değil; aile henüz işlevsel olarak doğrulanmadı.',
     })
     onFamily?.(familyIndex + 1, families.length)
   })
@@ -350,4 +504,3 @@ export function familyUtilityCaseCount(reports: readonly FamilyUtilityReport[]):
 export function boundedUtility(value: number): number {
   return clamp(value, -20, 20)
 }
-

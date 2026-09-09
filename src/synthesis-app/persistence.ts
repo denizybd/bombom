@@ -6,6 +6,7 @@ import {
   type SynthesisRun,
 } from '../synthesis'
 import { digestVector } from '../text-lab/engine/representation'
+import { createIndependentSourceIndex } from '../families/independence'
 
 const DATABASE_NAME = 'noron-sentez-laboratuvari'
 const DATABASE_VERSION = 1
@@ -163,6 +164,15 @@ function validateMemberRef(value: unknown, label: string): SynthesisMemberRef {
   const analysisRunId = requiredString(ref.analysisRunId, `${label}.analysisRunId`)
   const neuronId = requiredString(ref.neuronId, `${label}.neuronId`)
   requiredString(ref.sourceId, `${label}.sourceId`)
+  if (ref.independenceGroupId !== undefined) {
+    const independenceGroupId = requiredString(
+      ref.independenceGroupId,
+      `${label}.independenceGroupId`,
+    )
+    if (!independenceGroupId.trim() || independenceGroupId.includes('\u0000')) {
+      fail(`${label}.independenceGroupId geçersiz.`)
+    }
+  }
   const key = requiredMemberKey(ref.key, `${label}.key`)
   nonNegativeInteger(ref.paragraphIndex, `${label}.paragraphIndex`)
   const start = nonNegativeInteger(ref.start, `${label}.start`)
@@ -186,6 +196,7 @@ function sameMemberRef(left: SynthesisMemberRef, right: SynthesisMemberRef): boo
   return (
     left.key === right.key &&
     left.analysisRunId === right.analysisRunId &&
+    left.independenceGroupId === right.independenceGroupId &&
     left.sourceId === right.sourceId &&
     left.sourceDigest === right.sourceDigest &&
     left.neuronId === right.neuronId &&
@@ -264,7 +275,8 @@ function validateCandidate(
   const contextSupport = nonNegativeInteger(candidate.contextSupport, 'candidate.contextSupport')
   const supportCount = nonNegativeInteger(candidate.supportCount, 'candidate.supportCount')
   const sourceCount = nonNegativeInteger(candidate.sourceCount, 'candidate.sourceCount')
-  const independentSourceCount = new Set(supports.map((support) => support.sourceDigest)).size
+  const sourceIndex = createIndependentSourceIndex(supports)
+  const independentSourceCount = new Set(supports.map((support) => sourceIndex.groupKey(support))).size
   if (
     contextSupport !== supports.length ||
     supportCount !== supports.length ||

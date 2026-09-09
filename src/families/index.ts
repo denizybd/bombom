@@ -35,6 +35,7 @@ export { advanceCoalitions, buildEventCoalitions } from './coalition'
 export {
   applyUtilityLifecycle,
   measureFamilyAblationUtilities,
+  measureFamilyAblationUtilitiesOnEvaluation,
 } from './utility'
 
 export {

@@ -20,8 +20,11 @@ import {
   stableDigest,
   weightedSparseMean,
 } from './sparse'
+import { createIndependentSourceIndex } from './independence'
 
-export const BEHAVIOR_PROFILE_ENCODER_VERSION = 'structural-behavior-v1'
+// A new behavior space prevents immutable leaf-only family artifacts from
+// silently continuing into the multi-scale/abstaining discovery policy.
+export const BEHAVIOR_PROFILE_ENCODER_VERSION = 'structural-behavior-v2-multiscale-abstention'
 
 const graphemeSegmenter = new Intl.Segmenter('tr', { granularity: 'grapheme' })
 
@@ -261,6 +264,7 @@ function evidenceRef(
   return {
     memberKey: rawMemberKey(analysis.sourceDigest, analysis.runId, node.id),
     analysisRunId: analysis.runId,
+    independenceGroupId: analysis.independenceGroupId,
     sourceId: analysis.source.id,
     sourceDigest: analysis.sourceDigest,
     neuronId: node.id,
@@ -554,9 +558,22 @@ export function profilesFingerprint(profiles: readonly BehaviorProfile[]): strin
   ])
 }
 
+const evidenceConfidenceCache = new WeakMap<BehaviorProfile, number>()
+
 export function profileEvidenceConfidence(profile: BehaviorProfile): number {
-  const sources = new Set(profile.evidence.map((item) => item.sourceDigest)).size
-  return clamp(Math.log1p(profile.evidence.length) / Math.log(9)) * clamp(sources / 3)
+  const cached = evidenceConfidenceCache.get(profile)
+  if (cached !== undefined) return cached
+  if (!profile.evidence.length) return 0
+  if (profile.evidence.length === 1) {
+    const confidence = clamp(Math.log(2) / Math.log(9)) / 3
+    evidenceConfidenceCache.set(profile, confidence)
+    return confidence
+  }
+  const sourceIndex = createIndependentSourceIndex(profile.evidence)
+  const sources = new Set(profile.evidence.map((item) => sourceIndex.groupKey(item))).size
+  const confidence = clamp(Math.log1p(profile.evidence.length) / Math.log(9)) * clamp(sources / 3)
+  evidenceConfidenceCache.set(profile, confidence)
+  return confidence
 }
 
 export function profileRegionScore(profile: BehaviorProfile, region: RegionAffinity['region']): number {

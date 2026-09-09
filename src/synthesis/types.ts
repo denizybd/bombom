@@ -79,6 +79,7 @@ export interface SynthesisAnalysisInput {
   format: 'metin-laboratuvari-analysis'
   version: 2
   runId: string
+  independenceGroupId?: string
   sourceDigest: string
   identitySpaceId: string
   contextSpaceId: string
@@ -93,6 +94,8 @@ export interface SynthesisAnalysisInput {
 export interface SynthesisMemberRef {
   key: string
   analysisRunId: string
+  /** Stable provenance lineage; absent legacy records fall back to source/digest equivalence. */
+  independenceGroupId?: string
   sourceId: string
   sourceDigest: string
   neuronId: string

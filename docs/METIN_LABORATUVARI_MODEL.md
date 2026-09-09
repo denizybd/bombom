@@ -189,3 +189,30 @@ Farklı metinlerdeki aynı koordinatın gerçekten aynı fiziksel kurala ait old
 - `runId`: kaynak, temsil uzayı ve bölünme ayarına bağlı deney kimliği.
 
 Kaynaklar arası sentez yalnız aynı `representationSpaceId` taşıyan tamamlanmış analizleri birlikte kullanır. Yapı uyuşmazlığı sessiz dönüşümle gizlenmez.
+
+## 10. Temsil profilleri ve uyarlanabilir sayfa düzeni
+
+Temsil alanı artık adlandırılmış iki fiziksel sözleşme sunar. Bu ekleme mevcut
+kodlayıcıyı yerinde değiştirmez:
+
+- `legacy-quarter-id-v2`: mevcut varsayılan 64×64 düzen; `I=16×64`,
+  `R=48×64`. Profil alanı bulunmayan tarihsel kayıtlar bu sözleşme olarak
+  yorumlanır ve eski encoder kimliklerini kullanmaya devam eder.
+- `adaptive-eighth-id-v1`: yalnız açıkça seçilebilen yeni düzen; `I=8×64`,
+  `R=56×64`.
+
+Uyarlanabilir düzende `R`, 7×8 yerleşimli 56 sabit fiziksel `8×8`
+mikro-sayfaya ayrılır. Mikro-sayfalar henüz semantik bölge değildir; öğrenilen
+bölge atlası daha sonra bu sabit sayfalara yumuşak aidiyet atayabilir.
+
+Yeni kimlik kodlayıcısında her yüzey özelliğinin iki kopyası farklı kimlik
+sayfalarına yazılır. Kimlikten ilişkiye taban izdüşümü, her ilişki sayfasına bir
+kimlik sayfasının ayrı işaretli ve permüte edilmiş görünümünü taşır. Bu dönüşüm
+yalnız profil, geometri ve hash tohumu ile belirlenir; öğrenilmiş atlas sürümü
+taban kodlamayı değiştiremez.
+
+Profil değişimi migration sayılmaz. `16/48` vektörleri kesilerek veya yeniden
+örneklenerek `8/56` uzayına aktarılamaz. Yeni uzay ayrı identity/context/
+representation kimlikleri üretir ve yalnız ham kaynakların yeniden kodlanmasıyla
+oluşturulur. Eski analizler, snapshotlar ve replay zincirleri kendi uzaylarında
+okunabilir kalır.

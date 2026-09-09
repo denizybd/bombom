@@ -19,6 +19,8 @@ import type {
   SynthesisRunOptions,
   SynthesisStage,
 } from './types'
+import { createIndependentSourceIndex } from '../families/independence'
+import type { IndependentSourceIndex } from '../families/independence'
 
 const EPSILON = 1e-12
 
@@ -88,6 +90,7 @@ interface PreparedMember {
 interface PreparedInput {
   analyses: SynthesisReadyAnalysis[]
   members: PreparedMember[]
+  independentSources: IndependentSourceIndex
   representationSpaceId: string
   identityLength: number
   relationLength: number
@@ -255,6 +258,11 @@ function assertReadyAnalysis(value: SynthesisAnalysisInput): asserts value is Sy
     !candidate.sourceDigest ||
     typeof candidate.runId !== 'string' ||
     !candidate.runId ||
+    (candidate.independenceGroupId !== undefined && (
+      typeof candidate.independenceGroupId !== 'string' ||
+      !candidate.independenceGroupId.trim() ||
+      candidate.independenceGroupId.includes('\u0000')
+    )) ||
     !candidate.source ||
     typeof candidate.source.id !== 'string' ||
     !candidate.config ||
@@ -409,6 +417,7 @@ function prepareInput(
       const ref: SynthesisMemberRef = {
         key,
         analysisRunId: analysis.runId,
+        independenceGroupId: analysis.independenceGroupId,
         sourceId: analysis.source.id,
         sourceDigest: analysis.sourceDigest,
         neuronId: node.id,
@@ -429,7 +438,19 @@ function prepareInput(
     }
   }
   members.sort((left, right) => compareText(left.ref.key, right.ref.key))
-  return { analyses, members, representationSpaceId, identityLength, relationLength }
+  const independentSources = createIndependentSourceIndex(analyses.map((analysis) => ({
+    independenceGroupId: analysis.independenceGroupId,
+    sourceId: analysis.source.id,
+    sourceDigest: analysis.sourceDigest,
+  })))
+  return {
+    analyses,
+    members,
+    independentSources,
+    representationSpaceId,
+    identityLength,
+    relationLength,
+  }
 }
 
 function medianPositive(values: readonly number[]): number {
@@ -548,10 +569,14 @@ async function yieldToHost(options: SynthesisRunOptions): Promise<void> {
   throwIfCancelled(options)
 }
 
-function totalCrossSourcePairs(members: readonly PreparedMember[]): number {
+function totalCrossSourcePairs(
+  members: readonly PreparedMember[],
+  sourceIndex: IndependentSourceIndex,
+): number {
   const sourceCounts = new Map<string, number>()
   for (const member of members) {
-    sourceCounts.set(member.ref.sourceDigest, (sourceCounts.get(member.ref.sourceDigest) ?? 0) + 1)
+    const sourceGroup = sourceIndex.groupKey(member.ref)
+    sourceCounts.set(sourceGroup, (sourceCounts.get(sourceGroup) ?? 0) + 1)
   }
   let prior = 0
   let total = 0
@@ -564,16 +589,18 @@ function totalCrossSourcePairs(members: readonly PreparedMember[]): number {
 
 function groupMembersBySource(
   members: readonly PreparedMember[],
-): Array<{ sourceDigest: string; members: PreparedMember[] }> {
+  sourceIndex: IndependentSourceIndex,
+): Array<{ sourceGroup: string; members: PreparedMember[] }> {
   const groups = new Map<string, PreparedMember[]>()
   for (const member of members) {
-    const group = groups.get(member.ref.sourceDigest) ?? []
+    const sourceGroup = sourceIndex.groupKey(member.ref)
+    const group = groups.get(sourceGroup) ?? []
     group.push(member)
-    groups.set(member.ref.sourceDigest, group)
+    groups.set(sourceGroup, group)
   }
   return [...groups.entries()]
     .sort(([left], [right]) => compareText(left, right))
-    .map(([sourceDigest, sourceMembers]) => ({ sourceDigest, members: sourceMembers }))
+    .map(([sourceGroup, sourceMembers]) => ({ sourceGroup, members: sourceMembers }))
 }
 
 function buildEdge(
@@ -787,9 +814,10 @@ function buildCandidate(
   representationSpaceId: string,
   relationLength: number,
   config: SynthesisConfig,
+  sourceIndex: IndependentSourceIndex,
 ): SynthesisCandidate | null {
   const supports = independentSupports(members)
-  const sourceCount = new Set(supports.map((member) => member.ref.sourceDigest)).size
+  const sourceCount = new Set(supports.map((member) => sourceIndex.groupKey(member.ref))).size
   if (supports.length < config.minimumSupport || sourceCount < config.minimumSources) return null
 
   const medoid = chooseIdentityMedoid(supports)
@@ -906,7 +934,7 @@ export async function runSynthesis(
   )
   await yieldToHost(options)
 
-  const comparisonTotal = totalCrossSourcePairs(prepared.members)
+  const comparisonTotal = totalCrossSourcePairs(prepared.members, prepared.independentSources)
   const medianRelationNorm = medianPositive(
     prepared.members.map((member) => member.relationNorm),
   )
@@ -924,7 +952,7 @@ export async function runSynthesis(
     0,
   )
 
-  const sourceGroups = groupMembersBySource(prepared.members)
+  const sourceGroups = groupMembersBySource(prepared.members, prepared.independentSources)
   for (let leftSourceIndex = 0; leftSourceIndex < sourceGroups.length; leftSourceIndex += 1) {
     for (
       let rightSourceIndex = leftSourceIndex + 1;
@@ -1051,6 +1079,7 @@ export async function runSynthesis(
       prepared.representationSpaceId,
       prepared.relationLength,
       config,
+      prepared.independentSources,
     )
     if (candidate) candidates.push(candidate)
     if ((index + 1) % 32 === 0) {
@@ -1073,11 +1102,22 @@ export async function runSynthesis(
 
   const analysisRunIds = prepared.analyses.map((analysis) => analysis.runId).sort()
   const sourceDigests = [...new Set(prepared.analyses.map((analysis) => analysis.sourceDigest))].sort()
+  const sourceIndependenceManifest = prepared.analyses
+    .map((analysis) => [
+      analysis.runId,
+      prepared.independentSources.groupKey({
+        independenceGroupId: analysis.independenceGroupId,
+        sourceId: analysis.source.id,
+        sourceDigest: analysis.sourceDigest,
+      }),
+    ] as const)
+    .sort((left, right) => compareText(left[0], right[0]))
   const runFingerprint = fingerprintParts([
     'synthesis-run-v1',
     prepared.representationSpaceId,
     ...analysisRunIds,
     ...sourceDigests,
+    ...sourceIndependenceManifest.flat(),
     ...configFingerprintParts(config),
     ...edges.map((edge) => edge.fingerprint),
     ...candidates.map((candidate) => candidate.fingerprint),
@@ -1095,7 +1135,7 @@ export async function runSynthesis(
     candidates,
     stats: {
       inputAnalysisCount: prepared.analyses.length,
-      distinctSourceCount: sourceDigests.length,
+      distinctSourceCount: prepared.independentSources.groupCount,
       inputNeuronCount,
       eligibleNeuronCount: prepared.members.length,
       comparedPairCount: comparisons,

@@ -146,7 +146,13 @@ function analysis(
   }
 }
 
-function profile(memberKey: string, sourceDigest: string, coordinate: number): BehaviorProfile {
+function profile(
+  memberKey: string,
+  sourceDigest: string,
+  coordinate: number,
+  sourceId = sourceDigest,
+  independenceGroupId?: string,
+): BehaviorProfile {
   const vector = createSparseVector(8, [{ index: coordinate, value: 1 }])
   const regions: FunctionalRegionId[] = [
     'content', 'event', 'role', 'operator', 'goal', 'language', 'control',
@@ -167,7 +173,8 @@ function profile(memberKey: string, sourceDigest: string, coordinate: number): B
     evidence: [{
       memberKey,
       analysisRunId: 'run-test',
-      sourceId: sourceDigest,
+      independenceGroupId,
+      sourceId,
       sourceDigest,
       neuronId: memberKey,
       paragraphIndex: 0,
@@ -301,6 +308,39 @@ describe('seyrek H, G ve iki seviyeli yönlendirme', () => {
     expect(outgoing).toHaveLength(2)
     expect(outgoing.find((entry) => entry.toFamilyId === 'fb')?.probability).toBeCloseTo(0.5)
     expect(outgoing.find((entry) => entry.toFamilyId === 'fc')?.probability).toBeCloseTo(0.5)
+  })
+
+  it('aynı Ollama soyundaki geçişleri tek kaynak kanıtı olarak raporlar', () => {
+    const profiles = [
+      profile('a1', 'digest-a', 0, 'lesson-a', 'ollama:qwen14b'),
+      profile('b1', 'digest-a', 1, 'lesson-a', 'ollama:qwen14b'),
+      profile('a2', 'digest-b', 0, 'lesson-b', 'ollama:qwen14b'),
+      profile('b2', 'digest-b', 1, 'lesson-b', 'ollama:qwen14b'),
+      profile('c1', 'digest-c', 0, 'book-c', 'human:book-c'),
+      profile('d1', 'digest-c', 2, 'book-c', 'human:book-c'),
+    ]
+    const memberships = [
+      membership('a1', 'fa'), membership('b1', 'fb'),
+      membership('a2', 'fa'), membership('b2', 'fb'),
+      membership('c1', 'fa'), membership('d1', 'fc'),
+    ]
+    const result = buildFamilyTransitions(
+      [
+        { fromMemberKey: 'a1', toMemberKey: 'b1', probability: 1 },
+        { fromMemberKey: 'a2', toMemberKey: 'b2', probability: 1 },
+        { fromMemberKey: 'c1', toMemberKey: 'd1', probability: 1 },
+      ],
+      profiles,
+      [family('fa'), family('fb'), family('fc')],
+      memberships,
+      { ...CONFIG, maximumOutgoingFamilyTransitions: 3 },
+    )
+
+    const ollamaEdge = result.familyTransitions.find((entry) => (
+      entry.fromFamilyId === 'fa' && entry.toFamilyId === 'fb'
+    ))
+    expect(ollamaEdge?.sourceCount).toBe(1)
+    expect(ollamaEdge?.supportCount).toBe(2)
   })
 
   it('aday bulunmadığında açık unmatched sonucu döndürür', () => {

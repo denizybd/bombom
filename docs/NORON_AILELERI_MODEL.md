@@ -1,4 +1,4 @@
-# Nöron Aileleri — Matematiksel Model v1
+# Nöron Aileleri — Matematiksel Model v2
 
 Bu belge dördüncü programın sınırını tanımlar. Program, Metin Laboratuvarı'nın sabit kimlik (`I`), plastik ilişki (`R`) ve başlangıç geçiş önselini (`H⁰`) değiştirmeden okur; onaylanmış Nöron Sentezi kayıtlarını aynı kanıtların türevi olarak kullanır; davranış profilleri, yumuşak aile üyelikleri, seyrek aile geçişleri, geçici olay koalisyonları ve kaynak-ayrımlı susturma deneyleri üretir.
 
@@ -8,7 +8,7 @@ Programın amacı ham metinden kesin dilbilgisel veya anlamsal gerçek ilan etme
 
 Sistem şu kavramları birbirine karıştırmaz:
 
-1. **İşlev bölgesi:** Mimaride bulunan geniş çalışma sözleşmesi (`content`, `event`, `role`, `operator`, `goal`, `language`, `control`).
+1. **İşlev bölgesi:** Mimaride bulunan geniş çalışma sözleşmesi (`content`, `event`, `role`, `operator`, `unknown`, `goal`, `language`, `control`).
 2. **Öğrenilmiş aile:** Benzer davranış profillerinin veri içinden oluşturduğu kalıcı ama gözden geçirilebilir alt küme.
 3. **Geçici koalisyon:** Yalnız bir düşünce anında kurulan olay ve rol bağları.
 
@@ -79,6 +79,10 @@ Metin Laboratuvarı aynı paragrafı üst ve alt düğümlere böler. İç içe 
 ```
 
 Bir aile için destekler deterministik olarak seçilir; aynı kaynak ve paragraftaki çakışan aralıkların yalnız biri bağımsız oy verir. Aynı ham metnin farklı proje kimliğiyle yeniden içe aktarılması da yeni kaynak sayılmaz.
+Ayrıca aynı Ollama kampanya/model soyunda üretilmiş farklı metinler tek bağımsız
+kaynak grubu sayılır. Bu gruplama destek örneklerini silmez; minimum kaynak,
+kaynak dengeleme, holdout ve geçiş kaynak sayaçlarında korelasyonun birden fazla
+tanık gibi görünmesini engeller.
 
 Onaylı sentez nöronu yeni bağımsız kanıt değildir. Profili, adayın `independentSupports` kayıtlarının birleşiminden oluşur; destek ve kaynak sayaçlarına aday diye ilave bir oy eklenmez.
 
@@ -97,9 +101,20 @@ A_i = {
 
 Bu değerler sözlük etiketi değil; yapısal ve davranışsal ipuçlarının birleşimidir. Örneğin olay merkezi olma, rol bağlama kapasitesi, kısa kapsamlı değiştirici olma ve köprü davranışı ayrı kanıtlar üretir. Sonuç arayüzde daima “hipotez” olarak gösterilir.
 
+En yüksek statik puan `0.50` altında kalırsa veya ilk iki hipotez arasındaki
+fark `0.08` değerine ulaşmazsa aileye zorla semantik isim verilmez; bölge
+`unknown` olarak saklanır. Bu bir beşinci semantik sınıf değil, kanıt yetersizliği
+durumudur. Bölge puanlarının katsayıları bu güvenlik kapısı için değiştirilmez.
+
 `goal`, `language` ve `control` statik koşuda sıfır veya uykuda tutulur. Bu bölgelerin doğrulanması için çalışma zamanı hedefi, beklenen çıktı, düzeltme veya durma deneyimi gerekir.
 
 ## 6. Aile keşfi ve yumuşak üyelik
+
+Aile keşfinin çekirdek havuzu yalnız en kısa yapraklardan oluşmaz. Bütün yapraklar
+korunur; kökler ile sığ, orta ve derin ebeveynlerden kaynak-soyu dengeli,
+deterministik ve en fazla 4096 ek profil alınır. Ek bütçe korpus büyüklüğünün
+kareköküyle büyür. Böylece “kısa yaprak olma” özelliği tek başına bütün aileleri
+operatör bölgesine itmez ve tam üst-düğüm taramasıyla bellek sınırı bozulmaz.
 
 Davranış benzerliği seyrek kosinüs ile ölçülür:
 
@@ -192,6 +207,23 @@ Her aile yalnız en güçlü birkaç çıkışı saklar. `G`, kalıcı gerçek d
 ## 10. Kaynak-ayrımlı susturma deneyi
 
 Bir ailenin yalnız kümelenmiş olması faydalı olduğunu göstermez. İlk vekil görev, gizli komşu/aile tahminidir. Kaynaklar `sourceDigest` düzeyinde ayrılır; aynı kaynak hem eğitim hem sınama tarafında bulunamaz.
+
+Üretim hattı bağımsız kaynak soylarını koşudan önce bölebilir. `FamilyRunInput`
+üzerindeki `discoveryIndependenceGroupIds` yalnız prototip, küme ve `H⁰/G`
+öğrenmesine; `evaluationIndependenceGroupIds` ise yalnız dışarıdan yumuşak üyelik
+projeksiyonu ve fayda ölçümüne izin verir. Bütün profiller gözlem ve arayüz için
+çıkarılır, fakat değerlendirme profilleri aile çekirdeğine, kanıt sayacına veya
+geçiş tablosuna geri yazılmaz. Kopya içerik, ortak kaynak kimliği ya da ortak
+üretim soyu iki tarafı dolaylı olarak birleştiriyorsa koşu reddedilir.
+
+Ayrı değerlendirme bölümü varsa geçiş olasılıkları yalnız keşif bölümünden
+öğrenilir ve kayıp `declared-evaluation-diagnostic` olarak ayrı korpusta ölçülür.
+Değerlendirme kaydı bulunamazsa sistem sessizce bütün korpusu keşfe açmaz; yalnız
+keşif korpusu içinde eski kaynak-holdout tanısına döner, manifeste
+`discovery-source-holdout` yazar ve bunun dış holdout kanıtı olmadığını açıkça
+uyarır. Bu geri dönüş raporları `insufficient-evidence` kalır ve aile yaşam
+döngüsünü `stable` durumuna terfi ettiremez. Bölüm alanları hiç verilmezse eski
+tüm-korpus davranışı korunur.
 
 Tam model kaybı ile aile susturulmuş model kaybı karşılaştırılır:
 

@@ -85,19 +85,25 @@ function node(id: string, sourceId: string, start: number): FamilyNeuronInput {
   }
 }
 
-function analysis(sourceDigest: string, runId: string): FamilyAnalysisInput {
+function analysis(
+  sourceDigest: string,
+  runId: string,
+  physicalSourceId = sourceDigest,
+  independenceGroupId?: string,
+): FamilyAnalysisInput {
   const ids = [`a-${runId}`, `b-${runId}`, `c-${runId}`]
-  const nodes = ids.map((id, index) => node(id, sourceDigest, index))
+  const nodes = ids.map((id, index) => node(id, physicalSourceId, index))
   return {
     format: 'metin-laboratuvari-analysis',
     version: 2,
     runId,
     createdAt: '2026-08-28T00:00:00.000Z',
+    independenceGroupId,
     sourceDigest,
     identitySpaceId: 'IS-test',
     contextSpaceId: 'CS-test',
     representationSpaceId: 'RS-test',
-    source: { id: sourceDigest, title: sourceDigest, rawText: ids.join(''), text: ids.join('') },
+    source: { id: physicalSourceId, title: sourceDigest, rawText: ids.join(''), text: ids.join('') },
     config: {
       matrixSide: 8,
       identityRatio: 0.5,
@@ -177,6 +183,16 @@ function membershipsFor(analyses: readonly FamilyAnalysisInput[]): FamilyMembers
   })
 }
 
+function competingMemberships(analyses: readonly FamilyAnalysisInput[]): FamilyMembership[] {
+  return analyses.flatMap((item) => {
+    const keys = item.nodes.map((entry) => rawMemberKey(item.sourceDigest, item.runId, entry.id))
+    const sequence = item.source.id === 'book-b'
+      ? ['family-x', 'family-z', 'family-y']
+      : ['family-x', 'family-y', 'family-z']
+    return keys.map((key, index) => membership(key, sequence[index]))
+  })
+}
+
 describe('kaynak-holdout aile susturma testi', () => {
   it('her foldun bütün sourceDigest kaynağını eğitimden ayırdığı pozitif faydayı ölçer', () => {
     const analyses = [
@@ -218,6 +234,91 @@ describe('kaynak-holdout aile susturma testi', () => {
     expect(report.status).toBe('insufficient-evidence')
     expect(report.sourceFoldCount).toBe(0)
     expect(report.caseCount).toBe(0)
+  })
+
+  it('aynı kitabın analiz parçalarını tek holdout fold olarak birlikte tutar', () => {
+    const analyses = [
+      analysis('book-a-chunk-1', 'run-a1', 'book-a'),
+      analysis('book-a-chunk-2', 'run-a2', 'book-a'),
+      analysis('book-b', 'run-b', 'book-b'),
+      analysis('book-c', 'run-c', 'book-c'),
+    ]
+    const report = measureFamilyAblationUtilities(
+      analyses,
+      [family('family-b')],
+      membershipsFor(analyses),
+      CONFIG,
+    )[0]
+
+    expect(report.sourceFoldCount).toBe(3)
+    expect(report.folds.map((fold) => fold.heldOutSourceId)).toEqual(['book-a', 'book-b', 'book-c'])
+    expect(report.folds.find((fold) => fold.heldOutSourceId === 'book-a')?.caseCount).toBe(4)
+  })
+
+  it('aynı içerik özetini farklı kaynak adıyla yeniden yüklemeyi ayrı holdout saymaz', () => {
+    const analyses = [
+      analysis('same-content', 'run-original', 'book-original'),
+      analysis('same-content', 'run-copy', 'renamed-copy'),
+      analysis('other-b', 'run-b', 'book-b'),
+      analysis('other-c', 'run-c', 'book-c'),
+    ]
+    const report = measureFamilyAblationUtilities(
+      analyses,
+      [family('family-b')],
+      membershipsFor(analyses),
+      CONFIG,
+    )[0]
+
+    expect(report.sourceFoldCount).toBe(3)
+    expect(report.folds.find((fold) => fold.heldOutSourceId === 'book-original')?.caseCount).toBe(4)
+    expect(report.folds.some((fold) => fold.heldOutSourceId === 'renamed-copy')).toBe(false)
+  })
+
+  it('aynı Ollama üretim soyundaki farklı metinleri tek holdout foldta tutar', () => {
+    const analyses = [
+      analysis('lesson-a', 'run-a', 'lesson-a', 'ollama:qwen14b'),
+      analysis('lesson-b', 'run-b', 'lesson-b', 'ollama:qwen14b'),
+      analysis('book-b', 'run-c', 'book-b', 'human:book-b'),
+      analysis('book-c', 'run-d', 'book-c', 'human:book-c'),
+    ]
+    const report = measureFamilyAblationUtilities(
+      analyses,
+      [family('family-b')],
+      membershipsFor(analyses),
+      CONFIG,
+    )[0]
+
+    expect(report.sourceFoldCount).toBe(3)
+    expect(report.folds.find((fold) => fold.heldOutSourceId === 'lesson-a')?.caseCount).toBe(4)
+    expect(report.folds.some((fold) => fold.heldOutSourceId === 'lesson-b')).toBe(false)
+  })
+
+  it('bir kitabın fazla chunkının eğitim geçiş oyunu ağırlaştırmasına izin vermez', () => {
+    const firstChunk = analysis('book-a-chunk-1', 'run-a1', 'book-a')
+    const secondChunk = analysis('book-a-chunk-2', 'run-a2', 'book-a')
+    const other = analysis('book-b', 'run-b', 'book-b')
+    const heldOut = analysis('book-c', 'run-c', 'book-c')
+    const base = [firstChunk, other, heldOut]
+    const chunked = [firstChunk, secondChunk, other, heldOut]
+    const baseReport = measureFamilyAblationUtilities(
+      base,
+      [family('family-y')],
+      competingMemberships(base),
+      CONFIG,
+    )[0]
+    const chunkedReport = measureFamilyAblationUtilities(
+      chunked,
+      [family('family-y')],
+      competingMemberships(chunked),
+      CONFIG,
+    )[0]
+    const baseFold = baseReport.folds.find((fold) => fold.heldOutSourceId === 'book-c')
+    const chunkedFold = chunkedReport.folds.find((fold) => fold.heldOutSourceId === 'book-c')
+
+    expect(baseFold).toBeDefined()
+    expect(chunkedFold).toBeDefined()
+    expect(chunkedFold?.fullLoss).toBeCloseTo(baseFold?.fullLoss ?? Number.NaN, 12)
+    expect(chunkedFold?.ablatedLoss).toBeCloseTo(baseFold?.ablatedLoss ?? Number.NaN, 12)
   })
 
   it('yalnız kararlı ve doğrulanmış strengthening ailesini stable durumuna geçirir', () => {

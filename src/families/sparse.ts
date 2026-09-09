@@ -1,4 +1,4 @@
-import type { SparseCoordinate, SparseVector } from './types'
+import type { SparseCoordinate, SparseVector } from './types.ts'
 
 export const FAMILY_EPSILON = 1e-12
 
